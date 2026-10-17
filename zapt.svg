@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#16367f"/>
+      <stop offset="1" stop-color="#0a1b45"/>
+    </linearGradient>
+    <linearGradient id="bolt" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffe45c"/>
+      <stop offset="1" stop-color="#ffb800"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
+  <!-- raio que termina em ponta de seta para baixo -->
+  <path d="M158 30 L84 134 L120 134 L104 196 L178 110 L141 110 Z" fill="url(#bolt)" stroke="#fff3b0" stroke-width="3" stroke-linejoin="round"/>
+  <!-- base do download -->
+  <path d="M66 222 H190" stroke="#4cc9f0" stroke-width="14" stroke-linecap="round"/>
+</svg>
