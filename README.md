@@ -24,7 +24,7 @@ Feito para Ubuntu, Zorin OS e derivados (x86_64).
 ## Como usar
 
 ```bash
-curl -L -o criar-zapt-appimage.sh https://raw.githubusercontent.com/dkloi/zapt/main/criar-zapt-appimage.sh
+curl -L -o criar-zapt-appimage.sh https://raw.githubusercontent.com/dkdloi/zapt/main/criar-zapt-appimage.sh
 chmod +x criar-zapt-appimage.sh
 ./criar-zapt-appimage.sh
 ```
