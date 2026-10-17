@@ -15,6 +15,9 @@ Feito para Ubuntu, Zorin OS e derivados (x86_64).
 
 - **Baixar música ou vídeo** escolhendo formato (MP3, M4A, Opus, FLAC; MP4, MKV, WebM) e qualidade.
 - **Tamanho estimado antes de baixar**, para você decidir com a informação na mão.
+- **Vários links e playlists de uma vez**: cole quantos links quiser (um por linha) ou o link de uma playlist,
+  marque quais itens baixar e veja o **tamanho total estimado** antes de confirmar. Os itens entram numa fila e
+  são baixados um por vez, com barra de progresso geral; playlists vão para uma subpasta com o nome da lista.
 - **Converter** qualquer vídeo ou música local para presets de compartilhamento
   (Discord 20 MB / 50 MB, WhatsApp 16 MB, redes sociais), com o tamanho previsto antes de confirmar.
 - **Atualizar o yt-dlp pelo próprio app** (estável, nightly ou voltar ao original), sem apagar o AppImage.
@@ -24,7 +27,7 @@ Feito para Ubuntu, Zorin OS e derivados (x86_64).
 ## Como usar
 
 ```bash
-curl -L -o criar-zapt-appimage.sh https://raw.githubusercontent.com/dkdloi/zapt/main/criar-zapt-appimage.sh
+curl -L -o criar-zapt-appimage.sh https://raw.githubusercontent.com/dkloi/zapt/main/criar-zapt-appimage.sh
 chmod +x criar-zapt-appimage.sh
 ./criar-zapt-appimage.sh
 ```

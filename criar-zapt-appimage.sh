@@ -213,12 +213,16 @@ fmt_mb() {
         else s = sprintf("%.0f KB", b / 1e3);
         gsub(/\./, ",", s); print s }'
 }
+# Ao baixar vários itens, SIZE_MULT multiplica os tamanhos estimados de um item
+# (assim as telas já mostram o TOTAL). Fora disso fica em 1.
+SIZE_MULT=1
+scale_b() { awk -v b="$1" -v m="${SIZE_MULT:-1}" 'BEGIN { printf "%.0f", b * m }'; }
 fmt_size() {
-    if is_pos "$1"; then printf '≈ %s' "$(fmt_mb "$1")"; else printf 'tamanho desconhecido'; fi
+    if is_pos "$1"; then printf '≈ %s' "$(fmt_mb "$(scale_b "$1")")"; else printf 'tamanho desconhecido'; fi
 }
 size_range() {   # menor maior (bytes)
     if ! is_pos "$1" || ! is_pos "$2"; then printf 'tamanho desconhecido'; return; fi
-    if [ "$1" = "$2" ]; then fmt_size "$1"; else printf 'de ≈ %s a %s' "$(fmt_mb "$1")" "$(fmt_mb "$2")"; fi
+    if [ "$1" = "$2" ]; then fmt_size "$1"; else printf 'de ≈ %s a %s' "$(fmt_mb "$(scale_b "$1")")" "$(fmt_mb "$(scale_b "$2")")"; fi
 }
 fmt_dur() {
     awk -v s="$1" 'BEGIN {
@@ -400,6 +404,87 @@ ui_entry() {
     printf '%s' "$v"
 }
 
+# ui_links TEXTO -> imprime o que foi colado (um ou vários links)
+ui_links() {
+    local line out=""
+    if [ "$UI" = gui ]; then
+        mkwork
+        printf '%s\n' "# $1" "# Uma linha por link. Linhas que começam com # são ignoradas." "" >"$WORKD/links.txt"
+        zenity --text-info --editable --title="Zapt: cole os links" --filename="$WORKD/links.txt" \
+            --width=680 --height=380 --ok-label="Continuar" --cancel-label="Cancelar" 2>/dev/null
+        return $?
+    fi
+    printf '\n%s\n(Um link por linha. Linha em branco para continuar; em branco logo de início = cancelar.)\n' "$1" >&2
+    while IFS= read -r -p "> " line </dev/tty; do
+        [ -n "$line" ] || break
+        out+="$line"$'\n'
+    done
+    [ -n "$out" ] || return 1
+    printf '%s' "$out"
+}
+
+# Do texto colado, tira os links (separados por espaço ou linha), sem repetir e sem comentários
+links_from_text() {
+    awk '/^[[:space:]]*#/ { next } { for (i = 1; i <= NF; i++) if (!seen[$i]++) print $i }'
+}
+
+# sel_expr N EXPRESSÃO -> índices (1..N), um por linha.  "1,3,5-8", "menos 2,4", "todos" ou vazio.
+sel_expr() {
+    awk -v n="$1" -v e="$2" 'BEGIN {
+        e = tolower(e); gsub(/[ \t]/, "", e)
+        if (e == "" || e == "todos") { for (i = 1; i <= n; i++) print i; exit }
+        excl = 0
+        if (sub(/^menos/, "", e)) excl = 1
+        m = split(e, p, ",")
+        for (k = 1; k <= m; k++) {
+            if (p[k] ~ /^[0-9]+$/) { a = p[k] + 0; b = a }
+            else if (p[k] ~ /^[0-9]+-[0-9]+$/) { split(p[k], r, "-"); a = r[1] + 0; b = r[2] + 0 }
+            else exit 2
+            if (a > b || a < 1 || b > n) exit 2
+            for (i = a; i <= b; i++) s[i] = 1
+        }
+        for (i = 1; i <= n; i++) if ((excl && !(i in s)) || (!excl && (i in s))) print i
+    }'
+}
+
+# ui_checklist TÍTULO TEXTO CABEÇALHO1 CABEÇALHO2   (linhas "id|col1|col2", todas marcadas)
+# -> imprime os ids marcados, um por linha
+ui_checklist() {
+    local title="$1" text="$2" h1="$3" h2="$4"
+    local rows=() row id c1 c2 args=() n=0 ans sel i
+    mapfile -t rows
+    [ "${#rows[@]}" -gt 0 ] || return 1
+    if [ "$UI" = gui ]; then
+        for row in "${rows[@]}"; do
+            IFS='|' read -r id c1 c2 <<<"$row"
+            args+=(TRUE "$id" "$c1" "$c2")
+        done
+        zenity --list --checklist --title="$title" --text="$text" --width=840 --height=620 \
+            --column="" --column=id --column="$h1" --column="$h2" --hide-column=2 --print-column=2 \
+            --separator=$'\n' --ok-label="Continuar" --cancel-label="Voltar" "${args[@]}" 2>/dev/null
+        return $?
+    fi
+    while true; do
+        printf '\n%s\n\n' "$text" >&2
+        n=0
+        for row in "${rows[@]}"; do
+            n=$((n + 1))
+            IFS='|' read -r id c1 c2 <<<"$row"
+            printf ' %3d) %s  [%s]\n' "$n" "$c1" "$c2" >&2
+        done
+        printf '\nDigite os números a baixar (ex.: 1,3,5-8), "menos 2,4" para tirar alguns,\n"todos" ou Enter para todos.   0 = voltar\n' >&2
+        IFS= read -r -p "Escolha: " ans </dev/tty || return 1
+        [ "$ans" = 0 ] && return 1
+        sel="$(sel_expr "$n" "$ans")" || { printf 'Não entendi. Tente de novo.\n' >&2; continue; }
+        [ -n "$sel" ] || { printf 'Nada selecionado.\n' >&2; continue; }
+        while read -r i; do
+            IFS='|' read -r id _ <<<"${rows[$((i - 1))]}"
+            printf '%s\n' "$id"
+        done <<<"$sel"
+        return 0
+    done
+}
+
 # ui_confirm TEXTO [ROTULO_OK] [ROTULO_CANCELAR] [s|n = padrão no terminal] -> 0 se OK
 ui_confirm() {
     local a def="${4:-s}" hint="[S/n]"
@@ -433,7 +518,7 @@ ui_fail() {
     if [ "$UI" = gui ]; then
         mkwork
         f="$WORKD/erro.txt"
-        { printf '%s\n\n' "$2"; [ -s "$RUNLOG" ] && cat "$RUNLOG"; } >"$f"
+        { printf '%s\n\n' "$2"; [ -s "$RUNLOG" ] && grep -av '^\[download\] *[0-9.]*% of' "$RUNLOG"; } >"$f"
         zenity --text-info --title="$1" --filename="$f" --width=720 --height=420 2>/dev/null
     else
         printf '\n%s\n\n' "$2" >&2
@@ -474,13 +559,28 @@ enc_pct() {
         'BEGIN { p = ((c - 1) + (d > 0 ? t / 1e6 / d : 0)) / n * 100; if (p > 99) p = 99; if (p < 0) p = 0; printf "%d", p }'
 }
 
-# ui_run TEXTO COMANDO...     RUN_KIND=pulse|dl|enc
+# Progresso geral de uma fila de downloads (lê "k/n" em $WORKD/stage e o % do item atual no log)
+q_pct() {
+    local st cur tot ip
+    st="$(cat "$WORKD/stage" 2>/dev/null)"
+    cur="${st%/*}"
+    tot="${st#*/}"
+    ip="$(tail -c 20000 "$RUNLOG" 2>/dev/null | tac | sed '/^\[\[ITEM /q' | grep -ao '[0-9][0-9]*\(\.[0-9]*\)\?%' | head -n1)"
+    ip="${ip%\%}"; ip="${ip%%.*}"
+    case "$ip" in '' | *[!0-9]*) ip=0 ;; esac
+    awk -v c="${cur:-1}" -v n="${tot:-1}" -v t="$ip" \
+        'BEGIN { p = ((c - 1) + t / 100) / n * 100; if (p > 99) p = 99; if (p < 0) p = 0; printf "%d", p }'
+}
+
+# ui_run TEXTO COMANDO...     RUN_KIND=pulse|dl|dlq|enc
+# O comando pode mudar o texto mostrado escrevendo em $WORKD/runtext.
 # Nas janelas: roda em segundo plano com barra de progresso e botão Cancelar (retorna 130).
 # No terminal: roda direto, mostrando a saída do comando.
 ui_run() {
     local text="$1" pid rc pct args=()
     shift
     mkwork
+    rm -f "$WORKD/runtext"
     if [ "$UI" != gui ]; then
         printf '%s\n' "$text" >&2
         "$@"
@@ -490,13 +590,17 @@ ui_run() {
     : >"$RUNLOG"
     "$@" >"$RUNLOG" 2>&1 &
     pid=$!
-    if [ "${RUN_KIND:-pulse}" = enc ]; then args=(--percentage=0); else args=(--pulsate); fi
+    case "${RUN_KIND:-pulse}" in enc | dlq) args=(--percentage=0) ;; *) args=(--pulsate) ;; esac
     (
+        local cur
         while kill -0 "$pid" 2>/dev/null; do
+            cur="$text"
+            [ -s "$WORKD/runtext" ] && cur="$(cat "$WORKD/runtext")"
             case "${RUN_KIND:-pulse}" in
-                enc) pct="$(enc_pct)"; echo "$pct"; echo "# $text ($pct%)" ;;
-                dl) pct="$(grep -ao '[0-9][0-9.]*%' "$RUNLOG" 2>/dev/null | tail -n1)"; echo "# $text $pct" ;;
-                *) echo "# $text" ;;
+                enc) pct="$(enc_pct)"; echo "$pct"; echo "# $cur ($pct%)" ;;
+                dlq) pct="$(q_pct)"; echo "$pct"; echo "# $cur" ;;
+                dl) pct="$(grep -ao '[0-9][0-9.]*%' "$RUNLOG" 2>/dev/null | tail -n1)"; echo "# $cur $pct" ;;
+                *) echo "# $cur" ;;
             esac
             sleep 0.5
         done
@@ -504,6 +608,7 @@ ui_run() {
     ) | zenity --progress "${args[@]}" --auto-close --no-markup --title="Zapt" \
         --text="$text" --width=480 2>/dev/null
     rc=${PIPESTATUS[1]}
+    rm -f "$WORKD/runtext"
     if [ "$rc" -ne 0 ]; then
         kill_tree "$pid"
         wait "$pid" 2>/dev/null
@@ -569,7 +674,7 @@ EOF
 I_TYPE=""; I_TITLE=""; I_DUR=0
 BA_ID=""; BA_EXT=""; BA_ABR=""; BA_CODEC=""; BA_BYTES=""
 VROWS=()
-SEL_LABEL=""; SEL_BYTES=""; YARGS=()
+SEL_LABEL=""; SEL_BYTES=""; YARGS=(); YFALLBACK=""   # YFALLBACK: outro seletor (-f) para tentar se o 1º falhar
 DEST=""; DL_URL=""; SAVED=""; LAST_FILE=""
 
 fetch_info_job() {
@@ -596,6 +701,10 @@ parse_info() {
 info_text() {
     local t="$I_TITLE
 Duração: $(fmt_dur "$I_DUR")"
+    if [ "${BATCH_N:-1}" -gt 1 ]; then
+        t="$BATCH_N itens: os tamanhos abaixo são o TOTAL estimado (calculado pelo 1º item e pela duração dos demais).
+Item de exemplo: $t"
+    fi
     if [ -n "$BA_ID" ]; then t="$t · áudio original do site: $BA_EXT${BA_ABR:+ ~$BA_ABR kbps}"; fi
     printf '%s' "$t"
 }
@@ -617,17 +726,18 @@ audio_format_rows() {
 audio_quality_rows() {   # $1 = mp3|m4a|opus
     local list k
     case "$1" in
-        mp3) list="320:máxima 256:muito boa 192:recomendada 128:compacta 96:mínima" ;;
+        mp3) list="320:máxima 256:muito_boa 192:recomendada 128:compacta 96:mínima" ;;
         m4a) list="256:máxima 192:recomendada 128:compacta 96:mínima" ;;
         *) list="160:máxima 128:recomendada 96:compacta 64:mínima" ;;
     esac
     for k in $list; do
-        printf '%s|%s kbps — %s|%s\n' "${k%%:*}" "${k%%:*}" "${k#*:}" "$(fmt_size "$(audio_est "${k%%:*}")")"
+        printf '%s|%s kbps — %s|%s\n' "${k%%:*}" "${k%%:*}" "$(tr _ ' ' <<<"${k#*:}")" "$(fmt_size "$(audio_est "${k%%:*}")")"
     done
 }
 
 pick_audio() {
     local af aq def
+    YFALLBACK=""
     while true; do
         af="$(audio_format_rows | ui_choose "Música — formato" "$(info_text)" mp3 "Formato" "Detalhes e tamanho estimado")" || return 1
         case "$af" in
@@ -639,6 +749,7 @@ pick_audio() {
     case "$af" in
         orig)
             YARGS=(-f "${BA_ID}/ba/b" -x --audio-format best)
+            YFALLBACK="ba/b"
             SEL_LABEL="Original ($BA_EXT${BA_ABR:+, ~$BA_ABR kbps}), sem reconverter"
             SEL_BYTES="$BA_BYTES" ;;
         flac)
@@ -677,7 +788,8 @@ video_container_rows() {
 }
 
 pick_video() {
-    local c row i def pick n h lab bytes vv va sel
+    local c row i def pick n h lab bytes vv va sel asel
+    YFALLBACK=""
     local -a out=()
     n="$(video_container_rows | wc -l)"
     if [ "$n" -eq 0 ]; then
@@ -708,54 +820,271 @@ pick_video() {
     SEL_LABEL="${c^^} · $lab"
     YARGS=(-f "$sel/bv*[height<=$h]+ba/b[height<=$h]" --merge-output-format "$c" --remux-video "$c" \
         --embed-metadata --no-playlist -o "%(title)s.%(ext)s" --trim-filenames 180 -P "$DEST")
+    # Plano B se der erro (ex.: 403 numa faixa de áudio): mantém o MESMO vídeo e deixa o yt-dlp
+    # escolher o áudio sozinho (ele prefere a faixa original); sem áudio separado, tudo automático.
+    case "$c" in mp4) asel="ba[ext=m4a]/ba" ;; webm) asel="ba[ext=webm]/ba" ;; *) asel="ba" ;; esac
+    if [ -n "$va" ]; then
+        YFALLBACK="$vv+$asel/bv*[height<=$h]+ba/b[height<=$h]"
+    else
+        YFALLBACK="bv*[height<=$h]+ba/b[height<=$h]"
+    fi
+    if [ "${BATCH_N:-1}" -gt 1 ]; then
+        YFALLBACK=""
+        # vários itens: os códigos de formato do 1º vídeo não valem para os outros,
+        # então pede a mesma altura (e o mesmo tipo de codec) em cada um
+        case "$c" in
+            mp4) YARGS[1]="bv*[height<=$h][vcodec^=avc]+ba[ext=m4a]/bv*[height<=$h][ext=mp4]+ba/bv*[height<=$h]+ba/b[height<=$h]" ;;
+            webm) YARGS[1]="bv*[height<=$h][ext=webm]+ba[ext=webm]/bv*[height<=$h]+ba/b[height<=$h]" ;;
+            *) YARGS[1]="bv*[height<=$h]+ba/b[height<=$h]" ;;
+        esac
+    fi
     return 0
 }
 
-download_job() {
-    local nl=()
+# ydl_try URL [argumentos extras]: baixa com YARGS; se falhar e houver plano B (YFALLBACK),
+# tenta mais uma vez com ele (o que já foi baixado é reaproveitado pelo yt-dlp).
+ydl_try() {
+    local url="$1" nl=() rc fb=()
+    shift
     [ "$UI" = gui ] && nl=(--newline)
-    "$YTDLP" "${FFARGS[@]}" "${nl[@]}" "${YARGS[@]}" --print-to-file "after_move:filepath" "$SAVED" "$DL_URL"
+    "$YTDLP" "${FFARGS[@]}" "${nl[@]}" "${YARGS[@]}" "$@" \
+        --print-to-file "after_move:filepath" "$SAVED" "$url" </dev/null
+    rc=$?
+    if [ "$rc" -ne 0 ] && [ -n "$YFALLBACK" ]; then
+        printf '\nA primeira tentativa falhou; tentando de outro jeito...\n'
+        [ "${RUN_KIND:-}" = dl ] && printf '%s' "Tentando de outro jeito…" >"$WORKD/runtext"
+        fb=("${YARGS[@]}")
+        fb[1]="$YFALLBACK"
+        "$YTDLP" "${FFARGS[@]}" "${nl[@]}" "${fb[@]}" "$@" \
+            --print-to-file "after_move:filepath" "$SAVED" "$url" </dev/null
+        rc=$?
+    fi
+    return $rc
 }
 
-flow_download() {   # $1 = musica|video (vazio = pergunta)
-    local mode="${1:-}" url rc text
+download_job() { ydl_try "$DL_URL"; }
+
+# ---------------------------------------------------------------------------
+# Vários links, playlists e fila de downloads
+# ---------------------------------------------------------------------------
+ITEM_URL=(); ITEM_TITLE=(); ITEM_DUR=(); ITEM_GROUP=(); ITEM_SRC=()
+QSEL=(); BATCH_N=1; NLINKS=0
+
+# Lê cada link (sem baixar nada) e guarda o JSON em $WORKD/x<N>.json
+expand_job() {
+    local u i=0 msg
+    : >"$WORKD/xfail.txt"
+    while IFS= read -r u; do
+        i=$((i + 1))
+        msg="Lendo o link $i de $NLINKS…"
+        [ "$NLINKS" -eq 1 ] && msg="Buscando informações do link…"
+        printf '%s' "$msg" >"$WORKD/runtext"
+        if ! "$YTDLP" "${FFARGS[@]}" --flat-playlist --no-playlist --no-warnings -J "$u" \
+            >"$WORKD/x$i.json" </dev/null; then
+            printf '%s\n' "$u" >>"$WORKD/xfail.txt"
+            rm -f "$WORKD/x$i.json"
+        fi
+    done <"$WORKD/links.list"
+}
+
+# Monta a lista de itens (ITEM_*) a partir dos JSON lidos. Playlist vira vários itens.
+build_items() {
+    local i=0 u url title dur grp
+    ITEM_URL=(); ITEM_TITLE=(); ITEM_DUR=(); ITEM_GROUP=(); ITEM_SRC=()
+    while IFS= read -r u; do
+        i=$((i + 1))
+        [ -s "$WORKD/x$i.json" ] || continue
+        jq -e . "$WORKD/x$i.json" >/dev/null 2>&1 || continue
+        while IFS=$'\t' read -r url title dur grp; do
+            case "$url" in http://* | https://*) ;; *) continue ;; esac
+            [ "$grp" = "-" ] && grp=""
+            ITEM_URL+=("$url")
+            ITEM_TITLE+=("$title")
+            ITEM_DUR+=("${dur:-0}")
+            ITEM_GROUP+=("$grp")
+            ITEM_SRC+=("$i")
+        done < <(jq -r --arg u "$u" -f "$APP_SHARE/items.jq" "$WORKD/x$i.json" 2>/dev/null)
+    done <"$WORKD/links.list"
+}
+
+# Deixa escolher quais itens baixar (todos vêm marcados). Preenche QSEL com os índices.
+select_items() {
+    local i n="${#ITEM_URL[@]}" rows="" dur lab g sel
+    for ((i = 0; i < n; i++)); do
+        dur="—"
+        is_pos "${ITEM_DUR[$i]}" && dur="$(fmt_dur "${ITEM_DUR[$i]}")"
+        lab="${ITEM_TITLE[$i]//|//}"
+        g="${ITEM_GROUP[$i]}"
+        rows+="$i|$lab|$dur${g:+ · $g}"$'\n'
+    done
+    while true; do
+        sel="$(printf '%s' "$rows" | ui_checklist "Zapt" \
+            "Encontrei $n itens. Todos já vêm marcados; desmarque os que você não quer baixar." \
+            "Título" "Duração")" || return 1
+        mapfile -t QSEL <<<"$sel"
+        [ -n "${QSEL[0]:-}" ] && return 0
+        ui_info "Marque pelo menos um item."
+    done
+}
+
+fail_read() {
+    ui_fail "Zapt: não consegui ler o link" "Não consegui ler este link. Confira o endereço.
+Se for do YouTube e o erro for 403 ou de acesso, use Mais opções > Atualizar para a versão nightly."
+}
+
+# Baixa os itens de QSEL, um de cada vez, com as opções já escolhidas em YARGS
+queue_job() {
+    local i k=0 n="${#QSEL[@]}" grp=()
+    : >"$WORKD/qfail.txt"
+    for i in "${QSEL[@]}"; do
+        k=$((k + 1))
+        echo "$k/$n" >"$WORKD/stage"
+        printf 'Baixando %s de %s: %s' "$k" "$n" "${ITEM_TITLE[$i]}" >"$WORKD/runtext"
+        printf '\n[[ITEM %s/%s]] %s\n' "$k" "$n" "${ITEM_TITLE[$i]}"
+        grp=()
+        [ -n "${ITEM_GROUP[$i]}" ] && grp=(-P "$DEST/${ITEM_GROUP[$i]}")
+        ydl_try "${ITEM_URL[$i]}" "${grp[@]}" || printf '%s\n' "${ITEM_TITLE[$i]}" >>"$WORKD/qfail.txt"
+    done
+    return 0
+}
+
+batch_download() {   # depois do queue_job: mostra o resumo
+    local rc nfail=0 nsaved=0 total=0 f n="${#QSEL[@]}" text
+    RUN_KIND=dlq ui_run "Baixando…" queue_job
+    rc=$?
+    [ -s "$WORKD/qfail.txt" ] && nfail="$(wc -l <"$WORKD/qfail.txt")"
+    if [ -s "$SAVED" ]; then
+        nsaved="$(grep -c . "$SAVED")"
+        while IFS= read -r f; do
+            [ -f "$f" ] && total=$((total + $(stat -c %s "$f")))
+        done <"$SAVED"
+    fi
+    if [ "$rc" -eq 130 ]; then
+        ui_info "Cancelado. Os $nsaved itens que já tinham sido baixados continuam em: $DEST"
+        return 0
+    fi
+    if [ "$nfail" -eq 0 ]; then
+        text="Pronto! $n itens baixados."
+    else
+        text="Pronto! $((n - nfail)) de $n itens baixados."
+    fi
+    text+="
+Tamanho total: $(fmt_mb "$total")
+Pasta: $DEST"
+    if [ "$nfail" -gt 0 ]; then
+        text+="
+
+Não consegui baixar $nfail:
+$(head -n 10 "$WORKD/qfail.txt" | sed 's/^/ • /')"
+        [ "$nfail" -gt 10 ] && text+="
+  …e mais $((nfail - 10))."
+        text+="
+
+DICA: erros 403 do YouTube costumam ser passageiros; tente de novo.
+Se persistir, use Mais opções > Atualizar para a versão nightly."
+    fi
+    ui_info "$text"
+}
+
+download_main() {   # $1 = musica|video (vazio = pergunta)
+    local mode="${1:-}" txt rc text n i first tries nfail note mult
     mkwork
-    url="$(ui_entry "Zapt" "Cole o link do vídeo ou da música:")" || return 0
-    url="${url//[[:space:]]/}"
-    [ -n "$url" ] || return 0
+    SIZE_MULT=1; BATCH_N=1
+
+    txt="$(ui_links "Cole o link do vídeo ou da música. Dá para colar vários links (um por linha) e também links de playlist.")" || return 0
+    printf '%s\n' "$txt" | links_from_text >"$WORKD/links.list"
+    NLINKS="$(wc -l <"$WORKD/links.list")"
+    [ "$NLINKS" -gt 0 ] || return 0
     if [ -z "$mode" ]; then
         mode="$(printf '%s\n' 'musica|Música|somente o áudio' 'video|Vídeo|imagem e som' |
             ui_choose "Zapt" "O que você quer baixar?" musica "Tipo" "Detalhes")" || return 0
     fi
 
-    RUN_KIND=pulse ui_run "Buscando informações do vídeo…" fetch_info_job "$url"
+    RUN_KIND=pulse ui_run "Lendo o link…" expand_job
     rc=$?
     [ "$rc" -eq 130 ] && return 0
-    if [ "$rc" -ne 0 ] || ! parse_info; then
-        ui_fail "Zapt: não consegui ler o link" "Não consegui ler este link. Confira o endereço.
-Se for do YouTube e o erro for 403 ou de acesso, use Mais opções > Atualizar para a versão nightly."
+    build_items
+    nfail="$(wc -l <"$WORKD/xfail.txt")"
+    if [ "${#ITEM_URL[@]}" -eq 0 ]; then
+        fail_read
         return 0
     fi
-    if [ "$I_TYPE" = playlist ]; then
-        ui_info "Este link é de uma playlist. Cole o link de um vídeo ou de uma música específica."
-        return 0
+    if [ "$nfail" -gt 0 ]; then
+        ui_info "Não consegui ler $nfail dos links; sigo com os outros:
+$(sed 's/^/ • /' "$WORKD/xfail.txt")"
+    fi
+
+    # quais itens baixar
+    if [ "${#ITEM_URL[@]}" -eq 1 ]; then QSEL=(0); else select_items || return 0; fi
+    n="${#QSEL[@]}"
+
+    if [ "$n" -eq 1 ]; then
+        i="${QSEL[0]}"
+        if [ -z "${ITEM_GROUP[$i]}" ]; then
+            cp "$WORKD/x${ITEM_SRC[$i]}.json" "$WORKD/info.json"   # link solto: o JSON já é o completo
+        else
+            RUN_KIND=pulse ui_run "Buscando informações do vídeo…" fetch_info_job "${ITEM_URL[$i]}"
+            rc=$?
+            [ "$rc" -eq 130 ] && return 0
+            [ "$rc" -eq 0 ] || { fail_read; return 0; }
+        fi
+        parse_info || { fail_read; return 0; }
+        if [ "$I_TYPE" = playlist ]; then
+            ui_info "Este link leva a outra lista de vídeos. Abra a lista no navegador e cole o link de cada playlist."
+            return 0
+        fi
+    else
+        # vários itens: usa o primeiro que responder como exemplo para as opções e tamanhos
+        BATCH_N="$n"
+        first=-1
+        tries=0
+        for i in "${QSEL[@]}"; do
+            tries=$((tries + 1))
+            [ "$tries" -gt 3 ] && break
+            RUN_KIND=pulse ui_run "Lendo as opções de qualidade…" fetch_info_job "${ITEM_URL[$i]}"
+            rc=$?
+            [ "$rc" -eq 130 ] && return 0
+            if [ "$rc" -eq 0 ] && parse_info && [ "$I_TYPE" != playlist ]; then first="$i"; break; fi
+        done
+        if [ "$first" -lt 0 ]; then fail_read; return 0; fi
+        # total estimado = tamanho do 1º item × (soma das durações ÷ duração do 1º)
+        mult="$(for i in "${QSEL[@]}"; do echo "${ITEM_DUR[$i]}"; done |
+            awk -v d="$I_DUR" '{ s += ($1 + 0 > 0 && d + 0 > 0) ? $1 / d : 1 } END { printf "%.4f", s }')"
+        SIZE_MULT="$mult"
     fi
 
     DEST="$(dest_for "$mode")"
+    note=""
+    for i in "${QSEL[@]}"; do
+        [ -n "${ITEM_GROUP[$i]}" ] && { note=" (playlists em subpastas com o nome da lista)"; break; }
+    done
     while true; do
         if [ "$mode" = musica ]; then pick_audio || return 0; else pick_video || return 0; fi
-        text="Baixar com estas opções?
+        if [ "$n" -gt 1 ]; then
+            text="Baixar $n itens com estas opções?
+
+Formato: $SEL_LABEL
+Tamanho total estimado: $(fmt_size "$SEL_BYTES")
+Salvar em: $DEST$note"
+        else
+            text="Baixar com estas opções?
 
 Título: $I_TITLE
 Formato: $SEL_LABEL
 Tamanho estimado: $(fmt_size "$SEL_BYTES")
 Salvar em: $DEST"
+        fi
         ui_confirm "$text" "Baixar" "Voltar" && break
     done
 
     SAVED="$WORKD/saved.txt"
     : >"$SAVED"
-    DL_URL="$url"
+    if [ "$n" -gt 1 ]; then
+        batch_download
+        return 0
+    fi
+
+    DL_URL="${ITEM_URL[${QSEL[0]}]}"
     RUN_KIND=dl ui_run "Baixando…" download_job
     rc=$?
     [ "$rc" -eq 130 ] && return 0
@@ -778,6 +1107,14 @@ Quer converter para compartilhar (Discord, WhatsApp...)?" "Converter…" "Fechar
     else
         ui_info "Pronto! Salvo em: $DEST"
     fi
+}
+
+flow_download() {   # $1 = musica|video (vazio = pergunta)
+    local rc
+    download_main "$@"
+    rc=$?
+    SIZE_MULT=1; BATCH_N=1
+    return $rc
 }
 
 # ---------------------------------------------------------------------------
@@ -1315,6 +1652,10 @@ def ok_video($c):
   elif $c == "webm" then (.ext == "webm")
   else true end;
 
+# áudio: faixa ORIGINAL primeiro (como o yt-dlp; dublagens têm language_preference menor),
+# sem versões "DRC", depois maior taxa de bits; em empate, a primeira da lista
+def arank: [ (.language_preference // -1), (((.format_id // "") | test("drc")) | not), (.abr // .tbr // 0) ];
+
 def ok_audio($c):
   if $c == "mp4" then (.ext == "m4a")
   elif $c == "webm" then (.ext == "webm")
@@ -1324,7 +1665,7 @@ def ok_audio($c):
 | (.formats // []) as $f
 | ($f | map(select(.vcodec != "none" and ((.height // 0) > 0) and ok_video($cont)))) as $vids
 | ($f | map(select(.vcodec == "none" and ((.acodec // "x") != "none") and ok_audio($cont)))
-      | sort_by(.abr // .tbr // 0) | last) as $a
+      | to_entries | sort_by([(.value | arank), -.key]) | last | .value) as $a
 | $vids
 | group_by([.height, ((.fps // 30) >= 50)])
 | map(sort_by([codec_rank, vbr_eff]) | last)
@@ -1352,12 +1693,19 @@ cat > "$APPDIR/usr/share/ytdlp-app/baudio.jq" <<'BAUDIO_JQ_EOF'
 # Saída (uma linha, ou nada se o site não tem áudio separado):
 #   id|extensão|kbps|codec|bytes
 
+# Mesma ideia do yt-dlp: primeiro a faixa de áudio ORIGINAL (language_preference maior;
+# dublagens vêm abaixo), depois a que não é versão "DRC" (volume comprimido), depois a de
+# maior taxa de bits. Em empate, a primeira da lista.
+def arank: [ (.language_preference // -1), (((.format_id // "") | test("drc")) | not), (.abr // .tbr // 0) ];
+
 (.duration // 0) as $dur
 | [ (.formats // [])[]
     | select(.vcodec == "none" and ((.acodec // "x") != "none")) ]
-| sort_by(.abr // .tbr // 0)
+| to_entries
+| sort_by([(.value | arank), -.key])
 | last
 | select(. != null)
+| .value
 | (.filesize // .filesize_approx
    // (if ((.tbr // 0) > 0 and $dur > 0) then (.tbr * 125 * $dur) else null end)) as $sz
 | [ .format_id,
@@ -1367,6 +1715,30 @@ cat > "$APPDIR/usr/share/ytdlp-app/baudio.jq" <<'BAUDIO_JQ_EOF'
     (if $sz == null then "" else ($sz | floor) end) ]
 | join("|")
 BAUDIO_JQ_EOF
+
+cat > "$APPDIR/usr/share/ytdlp-app/items.jq" <<'ITEMS_JQ_EOF'
+# Entrada: JSON de um link (vídeo ou playlist, lido com --flat-playlist). Variável: $u = link original.
+# Saída: uma linha por item, separada por tab:  url  título  duração(s)  pasta
+# "pasta" é o nome da playlist (próprio para nome de pasta) ou "-" quando o item é um link solto.
+def clean: gsub("[\\x01-\\x1f]"; " ");
+if (._type // "video") == "playlist" then
+    ((.title // "playlist") | tostring | clean | gsub("[/\\\\:*?\"<>|]"; "_") | gsub("^[. ]+"; "") | .[0:80]) as $g
+    | (if $g == "" then "playlist" else $g end) as $g
+    | (.entries // [])[]
+    | select(. != null)
+    | [ (.url // .webpage_url // "-"),
+        ((.title // "sem título") | tostring | clean),
+        ((.duration // 0) | tonumber? // 0 | tostring),
+        $g ]
+    | @tsv
+else
+    [ $u,
+      ((.title // "sem título") | tostring | clean),
+      ((.duration // 0) | tonumber? // 0 | tostring),
+      "-" ]
+    | @tsv
+end
+ITEMS_JQ_EOF
 
 cat > "$APPDIR/zapt.desktop" <<'DESKTOP_EOF'
 [Desktop Entry]
