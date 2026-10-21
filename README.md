@@ -18,8 +18,23 @@ Feito para Ubuntu, Zorin OS e derivados (x86_64).
 - **Vários links e playlists de uma vez**: cole quantos links quiser (um por linha) ou o link de uma playlist,
   marque quais itens baixar e veja o **tamanho total estimado** antes de confirmar. Os itens entram numa fila e
   são baixados um por vez, com barra de progresso geral; playlists vão para uma subpasta com o nome da lista.
+- **Recortar um trecho** (por exemplo, de 1:20 até 2:45) ao baixar ou ao converter: o tamanho estimado já
+  considera só esse pedaço, o que ajuda a caber nos limites do Discord e do WhatsApp.
+- **Tamanho final comparado com o estimado** depois de baixar ou converter, com um histórico em
+  *Mais opções > Ver o histórico de estimativas* para acompanhar o quanto a estimativa erra.
 - **Converter** qualquer vídeo ou música local para presets de compartilhamento
   (Discord 20 MB / 50 MB, WhatsApp 16 MB, redes sociais), com o tamanho previsto antes de confirmar.
+- **Legendas**: ao baixar vídeo, escolha português, inglês ou outro idioma e se quer a legenda **embutida** no vídeo
+  ou num **arquivo .srt** separado (não vale junto com o recorte).
+- **Lembra das suas escolhas**: o último formato e qualidade já vêm marcados, ou você fixa um padrão
+  (*Mais opções > Preferências*).
+- **Aviso de versão nova do yt-dlp**: o Zapt confere de vez em quando (no máximo a cada 12 horas) e pergunta se
+  quer atualizar, útil porque o YouTube muda sempre e versões velhas dão erro 403. Dá para desligar nas preferências.
+- **Aceleração por hardware** (opcional) na conversão de vídeo, usando a placa de vídeo Intel/AMD via VAAPI, com
+  teste embutido e volta automática para a CPU se falhar. Em *Mais opções > Preferências*.
+- **Converter direto do gerenciador de arquivos**: botão direito num vídeo ou música > *Scripts > Converter para
+  compartilhar (Zapt)* (Nautilus/Nemo) ou *Abrir com > Converter para compartilhar (Zapt)*. Também funciona
+  arrastando arquivos para o ícone e com vários arquivos de uma vez.
 - **Atualizar o yt-dlp pelo próprio app** (estável, nightly ou voltar ao original), sem apagar o AppImage.
 - **Atalho no menu de aplicativos**, com ações rápidas (Música, Vídeo, Converter, Atualizar).
 - Funciona em **janelas (zenity)** ou, sem ele, **no terminal**.
@@ -39,7 +54,9 @@ pedindo a sua senha só se necessário. No fim aparece o arquivo `zapt-x86_64.Ap
 ./zapt-x86_64.AppImage
 ```
 
-Para ter o ícone no menu de aplicativos: **Mais opções > Criar atalho**.
+Para ter o ícone no menu de aplicativos e o botão direito nos arquivos: **Mais opções > Criar atalho**.
+
+Para a aceleração por hardware em vídeo Intel, pode ser preciso `sudo apt install intel-media-va-driver-non-free vainfo`.
 
 ### Opções do script
 
