@@ -10,6 +10,10 @@
 #   ./criar-zapt-appimage.sh --sem-ffmpeg   # sem ffmpeg (sem MP3, sem conversão)
 #
 #   ./criar-zapt-appimage.sh --so-dependencias   # só confere/instala as dependências
+#   ./criar-zapt-appimage.sh --limpar-cache      # apaga os downloads guardados (~215 MB) e sai
+#   ./criar-zapt-appimage.sh --sem-cache         # baixa tudo de novo, sem usar nem guardar o cache
+#
+# Os downloads ficam em ~/.cache/zapt: ao rodar de novo, só baixa o que tiver versão nova.
 #
 # As dependências (curl, xz-utils, unzip, zenity e a biblioteca FUSE) são conferidas e
 # instaladas automaticamente com apt; só pede a sua senha se algo estiver faltando.
@@ -20,12 +24,16 @@ set -euo pipefail
 WITH_FFMPEG=1
 WITH_DENO=1
 ONLY_DEPS=0
+USE_CACHE=1
+CLEAN_CACHE=0
 for arg in "$@"; do
     case "$arg" in
         --sem-ffmpeg) WITH_FFMPEG=0 ;;
         --sem-deno)   WITH_DENO=0 ;;
         --so-dependencias) ONLY_DEPS=1 ;;
-        -h|--help)    sed -n '2,15p' "$0"; exit 0 ;;
+        --sem-cache)  USE_CACHE=0 ;;
+        --limpar-cache) CLEAN_CACHE=1 ;;
+        -h|--help)    sed -n '2,20p' "$0"; exit 0 ;;
         *) echo "Opção desconhecida: $arg" >&2; exit 1 ;;
     esac
 done
@@ -33,6 +41,13 @@ done
 if [ "$(uname -m)" != "x86_64" ]; then
     echo "Este script gera AppImage apenas para x86_64." >&2
     exit 1
+fi
+
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/zapt"
+if [ "$CLEAN_CACHE" = 1 ]; then
+    rm -rf "$CACHE_DIR"
+    echo "Cache apagado: $CACHE_DIR"
+    exit 0
 fi
 
 # ---------------------------------------------------------------------------
@@ -86,18 +101,56 @@ trap 'rm -rf "$WORK" "$TMP_IMG"' EXIT
 APPDIR="$WORK/AppDir"
 mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/ytdlp-app"
 
+# ---------------------------------------------------------------------------
+# Downloads com cache (~/.cache/zapt): só baixa de novo se a versão no site mudou
+# ---------------------------------------------------------------------------
+remote_stamp() {   # url -> "etag tamanho data" do arquivo final (depois dos redirecionamentos)
+    curl -fsSIL --max-time 20 "$1" 2>/dev/null | tr -d '\r' | awk '
+        /^HTTP\// { e = ""; c = ""; m = "" }
+        tolower($1) == "etag:" { e = $2 }
+        tolower($1) == "content-length:" { c = $2 }
+        tolower($1) == "last-modified:" { m = $0; sub(/^[^:]*: */, "", m) }
+        END { if (e != "" || c != "") print e "|" c "|" m }'
+}
+
+fetch() {   # rótulo url destino
+    local label="$1" url="$2" dest="$3" f new
+    if [ "$USE_CACHE" != 1 ] || ! mkdir -p "$CACHE_DIR" 2>/dev/null; then
+        curl -fL --progress-bar -o "$dest" "$url"
+        return $?
+    fi
+    f="$CACHE_DIR/$(printf '%s' "$url" | cksum | cut -d' ' -f1)-${url##*/}"
+    new="$(remote_stamp "$url")"
+    if [ -s "$f" ] && [ -n "$new" ] && [ "$new" = "$(cat "$f.stamp" 2>/dev/null)" ]; then
+        echo "    $label: já é a versão mais recente (do cache)."
+    elif [ -s "$f" ] && [ -z "$new" ]; then
+        echo "    $label: não consegui conferir a versão; usando a cópia do cache."
+    else
+        echo "    $label: baixando..."
+        if curl -fL --progress-bar -o "$f.part" "$url"; then
+            mv -f "$f.part" "$f"
+            printf '%s' "$new" >"$f.stamp"
+        else
+            rm -f "$f.part"
+            if [ -s "$f" ]; then
+                echo "    $label: o download falhou; usando a cópia do cache." >&2
+            else
+                return 1
+            fi
+        fi
+    fi
+    cp -f "$f" "$dest"
+}
+
 echo "==> Baixando yt-dlp..."
-curl -fL --progress-bar -o "$APPDIR/usr/bin/yt-dlp" \
-    https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux
+fetch yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux "$APPDIR/usr/bin/yt-dlp"
 
 echo "==> Baixando jq (lê as informações dos vídeos)..."
-curl -fL --progress-bar -o "$APPDIR/usr/bin/jq" \
-    https://github.com/jqlang/jq/releases/latest/download/jq-linux-amd64
+fetch jq https://github.com/jqlang/jq/releases/latest/download/jq-linux-amd64 "$APPDIR/usr/bin/jq"
 
 if [ "$WITH_FFMPEG" = 1 ]; then
     echo "==> Baixando ffmpeg (build estático do projeto yt-dlp)..."
-    curl -fL --progress-bar -o "$WORK/ffmpeg.tar.xz" \
-        https://github.com/yt-dlp/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-gpl.tar.xz
+    fetch ffmpeg https://github.com/yt-dlp/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-linux64-gpl.tar.xz "$WORK/ffmpeg.tar.xz"
     tar -xJf "$WORK/ffmpeg.tar.xz" -C "$APPDIR/usr/bin" --strip-components=2 \
         ffmpeg-master-latest-linux64-gpl/bin/ffmpeg \
         ffmpeg-master-latest-linux64-gpl/bin/ffprobe
@@ -105,14 +158,12 @@ fi
 
 if [ "$WITH_DENO" = 1 ]; then
     echo "==> Baixando Deno (necessário para o yt-dlp baixar do YouTube)..."
-    curl -fL --progress-bar -o "$WORK/deno.zip" \
-        https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip
+    fetch deno https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip "$WORK/deno.zip"
     unzip -q -o "$WORK/deno.zip" deno -d "$APPDIR/usr/bin"
 fi
 
 echo "==> Baixando appimagetool..."
-curl -fL --progress-bar -o "$WORK/appimagetool" \
-    https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+fetch appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage "$WORK/appimagetool"
 chmod +x "$WORK/appimagetool"
 
 echo "==> Montando o AppDir..."
@@ -123,6 +174,7 @@ HERE="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 export PATH="$HERE/usr/bin:$PATH"
 export LC_NUMERIC=C
 
+ZAPT_VERSION="2026.10.23"
 APP_SHARE="$HERE/usr/share/ytdlp-app"
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/yt-dlp-appimage"
 USER_BIN="$DATA_DIR/yt-dlp"            # cópia do yt-dlp que o app atualiza
@@ -141,6 +193,7 @@ FFARGS=()
 if [ -x "$HERE/usr/bin/ffmpeg" ]; then
     FFARGS=(--ffmpeg-location "$HERE/usr/bin")
 fi
+BASE_FFARGS=("${FFARGS[@]}")
 
 # Se o AppImage foi recriado (traz outro yt-dlp), descarta a cópia atualizada antiga
 if [ -x "$USER_BIN" ] && [ "$(cat "$BASE_ID_FILE" 2>/dev/null)" != "$BUNDLED_ID" ]; then
@@ -181,7 +234,8 @@ reset_update() {
 about_text() {
     local origem="embutida no app"
     [ "$YTDLP" = "$USER_BIN" ] && origem="atualizada pelo app"
-    echo "Zapt: $("$YTDLP" --version 2>/dev/null) ($origem)"
+    echo "Zapt: $ZAPT_VERSION"
+    echo "yt-dlp: $("$YTDLP" --version 2>/dev/null) ($origem)"
     echo "ffmpeg: $(ffmpeg -version 2>/dev/null | head -n1 | cut -d' ' -f1-3)"
     echo "deno: $(deno --version 2>/dev/null | head -n1)"
     echo "AppImage: ${APPIMAGE:-(não está rodando como AppImage)}"
@@ -278,14 +332,52 @@ minmax() {       # lê linhas "a|b|bytes|..." e imprime "menor|maior"
 
 # Pasta de destino: ~/Música para música, ~/Vídeos para vídeo
 dest_for() {
-    local d=""
-    if [ "$1" = "musica" ]; then
+    local d="" k="$1"
+    d="$(pref_get "dir_$k")"
+    if [ -n "$d" ]; then
+        mkdir -p "$d" 2>/dev/null
+        [ -d "$d" ] && { echo "$d"; return 0; }
+    fi
+    if [ "$k" = "musica" ]; then
         d="$(xdg-user-dir MUSIC 2>/dev/null || true)"
     else
         d="$(xdg-user-dir VIDEOS 2>/dev/null || true)"
     fi
     if [ -z "$d" ] || [ ! -d "$d" ]; then d="$HOME"; fi
     echo "$d"
+}
+
+# ---------------------------------------------------------------------------
+# Nome dos arquivos e metadados da música
+# ---------------------------------------------------------------------------
+name_tpl() {   # modelo (sem extensão) do nome do arquivo, do yt-dlp
+    case "$(pref_get name_tpl titulo)" in
+        canal) printf '%s' '%(uploader|Desconhecido)s - %(title)s' ;;
+        data) printf '%s' '%(upload_date>%Y-%m-%d|sem data)s - %(title)s' ;;
+        artista) printf '%s' '%(artist,uploader|Desconhecido)s - %(title)s' ;;
+        *) printf '%s' '%(title)s' ;;
+    esac
+}
+name_label() {
+    case "$(pref_get name_tpl titulo)" in
+        canal) printf 'Canal - Título' ;;
+        data) printf 'Data - Título' ;;
+        artista) printf 'Artista - Título' ;;
+        *) printf 'Título' ;;
+    esac
+}
+
+# Música: tira "(Official Video)", "[Lyrics]"... do título e separa "Artista - Título" nas etiquetas
+META_ARGS=()
+meta_args() {
+    META_ARGS=()
+    [ "$(pref_get meta_clean off)" = on ] || return 0
+    META_ARGS=(
+        --replace-in-metadata title '(?i)\s*[\(\[][^\)\]]*(official|oficial|lyrics?|letra|visuali[sz]er|audio|áudio|video|vídeo|clipe|\bmv\b|\bhd\b|\b4k\b)[^\)\]]*[\)\]]' ''
+        --replace-in-metadata uploader ' - Topic$' ''
+        --replace-in-metadata artist ' - Topic$' ''
+        --parse-metadata 'title:(?P<artist>.+?)\s+-\s+(?P<title>.+)'
+    )
 }
 
 # ---------------------------------------------------------------------------
@@ -645,17 +737,90 @@ ui_info() {
     fi
 }
 
-# ui_fail TÍTULO DICA   (mostra a dica e, nas janelas, a saída do último comando)
+# ui_fail TÍTULO DICA   (mostra a dica e a saída do último comando; dá para copiar um relatório)
+clip_copy() {   # arquivo -> 0 se conseguiu copiar para a área de transferência
+    if [ -n "${WAYLAND_DISPLAY:-}" ] && command -v wl-copy >/dev/null 2>&1; then
+        wl-copy <"$1"
+    elif [ -n "${DISPLAY:-}" ] && command -v xclip >/dev/null 2>&1; then
+        xclip -selection clipboard <"$1"
+    elif [ -n "${DISPLAY:-}" ] && command -v xsel >/dev/null 2>&1; then
+        xsel --clipboard --input <"$1"
+    else
+        return 1
+    fi
+}
+
+make_report() {   # título mensagem -> $WORKD/relatorio.txt
+    local f="$WORKD/relatorio.txt" os
+    os="$(. /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-Linux}")"
+    {
+        echo "=== Relatório de erro do Zapt ==="
+        echo "Data: $(date '+%Y-%m-%d %H:%M:%S %z')"
+        echo "Zapt: $ZAPT_VERSION"
+        echo "yt-dlp: $("$YTDLP" --version 2>/dev/null) ($([ "$YTDLP" = "$USER_BIN" ] && echo 'atualizado pelo app' || echo 'embutido no app'))"
+        echo "ffmpeg: $(ffmpeg -version 2>/dev/null | head -n1 | cut -d' ' -f1-3)"
+        echo "deno: $(deno --version 2>/dev/null | head -n1)"
+        echo "Sistema: $os ($(uname -r))"
+        echo "Interface: ${UI:-?}"
+        echo
+        echo "Onde: $1"
+        if [ -s "$WORKD/links.list" ]; then
+            echo "Links:"
+            sed 's/^/  /' "$WORKD/links.list"
+        elif [ -n "${DL_URL:-}" ]; then
+            echo "Link: $DL_URL"
+        fi
+        case "$1" in *baixar* | *"ler o link"*)
+            [ "${#YARGS[@]}" -gt 0 ] && echo "Opções do yt-dlp: ${YARGS[*]}" ;;
+        esac
+        echo
+        echo "Mensagem do Zapt:"
+        printf '%s\n' "$2"
+        echo
+        echo "Saída do último comando (sem as barras de progresso):"
+        {
+            [ -s "$RUNLOG" ] && cat "$RUNLOG"
+            [ "$UI" != gui ] && [ -s "$WORKD/lasterr" ] && cat "$WORKD/lasterr"
+        } 2>/dev/null | grep -av '^\[download\] *[0-9.]*% of' | tail -n 60
+    } 2>&1 | sed "s|$HOME|~|g" >"$f"
+}
+
+report_copy() {   # título mensagem
+    local out
+    mkwork
+    make_report "$1" "$2"
+    if clip_copy "$WORKD/relatorio.txt"; then
+        ui_info "Relatório copiado! Cole (Ctrl+V) numa mensagem para quem está te ajudando.
+
+Ele tem as versões, o sistema, o link e a saída do erro (o seu nome de usuário é trocado por ~)."
+    else
+        out="$HOME/Zapt-relatorio-$(date +%Y%m%d-%H%M%S).txt"
+        cp "$WORKD/relatorio.txt" "$out"
+        ui_info "Não consegui copiar automaticamente (instale o xclip ou o wl-clipboard para isso).
+
+Salvei o relatório em:
+$out
+
+É só enviar esse arquivo para quem está te ajudando."
+    fi
+}
+
 ui_fail() {
-    local f
+    local f out
+    mkwork
+    f="$WORKD/erro.txt"
     if [ "$UI" = gui ]; then
-        mkwork
-        f="$WORKD/erro.txt"
         { printf '%s\n\n' "$2"; [ -s "$RUNLOG" ] && grep -av '^\[download\] *[0-9.]*% of' "$RUNLOG"; } >"$f"
-        zenity --text-info --title="$1" --filename="$f" --width=720 --height=420 2>/dev/null
+        while true; do
+            out="$(zenity --text-info --title="$1" --filename="$f" --width=720 --height=420 \
+                --ok-label="Fechar" --extra-button="Copiar relatório" 2>/dev/null)"
+            [ "$out" = "Copiar relatório" ] || return 0
+            report_copy "$1" "$2"
+        done
     else
         printf '\n%s\n\n' "$2" >&2
-        pause
+        IFS= read -r -p "Enter para continuar, ou R para copiar o relatório: " out </dev/tty || true
+        case "$out" in r | R) report_copy "$1" "$2" ;; esac
     fi
 }
 
@@ -678,6 +843,23 @@ ui_pick_file() {
     case "$f" in "~/"*) f="$HOME/${f:2}" ;; esac
     [ -n "$f" ] || return 1
     printf '%s' "$f"
+}
+
+# ui_pick_dir TÍTULO PASTA_INICIAL -> imprime a pasta escolhida
+ui_pick_dir() {
+    local d
+    if [ "$UI" = gui ]; then
+        zenity --file-selection --directory --title="$1" --filename="${2%/}/" 2>/dev/null
+        return $?
+    fi
+    printf '\n%s\nArraste a pasta para cá (ou digite o caminho) e pressione Enter.\n' "$1" >&2
+    printf 'Enter em branco = voltar.\n' >&2
+    IFS= read -r -p "> " d </dev/tty || return 1
+    d="${d#\'}"; d="${d%\'}"; d="${d#\"}"; d="${d%\"}"
+    d="${d//\\ / }"
+    case "$d" in "~/"*) d="$HOME/${d:2}" ;; esac
+    [ -d "$d" ] || return 1
+    printf '%s' "$d"
 }
 
 # Mostra a porcentagem de uma conversão lendo o arquivo de progresso do ffmpeg
@@ -762,6 +944,7 @@ update_job() {
 flow_update() {   # $1 = ""|nightly|stable
     local before after rc
     mkwork
+    : >"$WORKD/lasterr"
     ensure_user_bin
     before="$("$USER_BIN" --version 2>/dev/null)"
     RUN_KIND=pulse ui_run "Atualizando o yt-dlp…" update_job "$1"
@@ -871,6 +1054,158 @@ O YouTube muda sempre e versões antigas podem dar erro 403. Atualizar agora?" "
     fi
 }
 
+# ---------------------------------------------------------------------------
+# Aviso de versão nova do próprio Zapt (o arquivo VERSION do repositório no GitHub)
+# ---------------------------------------------------------------------------
+ZAPT_RAW_BASE="${ZAPT_RAW_BASE:-https://raw.githubusercontent.com/dkdloi/zapt/main}"
+ZAPT_PAGE="${ZAPT_PAGE:-https://github.com/dkdloi/zapt}"
+APPUPD_CACHE="$DATA_DIR/app_update_check"   # "<epoch> <versão ou ->"
+
+http_get() {   # url -> corpo (vazio se falhar)
+    local u="$1"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsS --max-time 4 "$u" 2>/dev/null
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- -T 4 "$u" 2>/dev/null
+    elif command -v deno >/dev/null 2>&1; then
+        timeout 6 deno eval --allow-net "const r=await fetch('$u');if(r.ok)console.log(await r.text())" 2>/dev/null
+    fi
+}
+
+app_latest_known() {   # $1 = "cache" para só olhar o cache (sem rede)
+    local now t v ttl
+    now="$(date +%s)"
+    if [ -s "$APPUPD_CACHE" ]; then
+        read -r t v <"$APPUPD_CACHE"
+        if [ -n "$t" ]; then
+            ttl=43200; [ "$v" = "-" ] && ttl=3600
+            if [ "$((now - t))" -lt "$ttl" ] || [ "${1:-}" = cache ]; then
+                [ "$v" = "-" ] || printf '%s' "$v"
+                return 0
+            fi
+        fi
+    fi
+    [ "${1:-}" = cache ] && return 0
+    v="$(http_get "$ZAPT_RAW_BASE/VERSION" | head -n1 | tr -d '[:space:]')"
+    printf '%s' "$v" | grep -Eq '^[0-9]{4}\.[0-9]{2}\.[0-9]{2}(\.[0-9]+)?$' || v=""
+    mkdir -p "$DATA_DIR"
+    printf '%s %s\n' "$now" "${v:--}" >"$APPUPD_CACHE"
+    printf '%s' "$v"
+}
+
+APPUPD_ASKED=0
+app_update_notice() {
+    local lat
+    [ "$APPUPD_ASKED" = 0 ] || return 0
+    APPUPD_ASKED=1
+    [ "$(pref_get app_update_check on)" = on ] || return 0
+    lat="$(app_latest_known)"
+    version_newer "$lat" "$ZAPT_VERSION" || return 0
+    [ "$(pref_get app_update_seen)" = "$lat" ] && return 0
+    pref_set app_update_seen "$lat"
+    if ui_confirm "Há uma versão nova do Zapt.
+
+Você usa: $ZAPT_VERSION
+Nova: $lat
+
+Para atualizar, baixe o script novo na página do Zapt e rode de novo (o AppImage atual é guardado como .anterior). Abrir a página agora?" "Abrir a página" "Agora não"; then
+        xdg-open "$ZAPT_PAGE" >/dev/null 2>&1 || ui_info "Abra no navegador: $ZAPT_PAGE"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Cookies do navegador (vídeos com restrição de idade, só para membros, verificação anti-robô)
+# ---------------------------------------------------------------------------
+apply_cookies() {   # liga/desliga --cookies-from-browser em todas as chamadas do yt-dlp dentro do app
+    local b
+    FFARGS=("${BASE_FFARGS[@]}")
+    b="$(pref_get cookies)"
+    [ -n "$b" ] && FFARGS+=(--cookies-from-browser "$b")
+    return 0
+}
+
+any_dir() { local d; for d in "$@"; do [ -d "$d" ] && return 0; done; return 1; }
+
+detect_browsers() {   # linhas "id|Nome|onde" dos navegadores com perfil nesta conta
+    local h="$HOME"
+    any_dir "$h/.mozilla/firefox" "$h/.config/mozilla/firefox" "$h/snap/firefox/common/.mozilla/firefox" "$h/.var/app/org.mozilla.firefox" &&
+        echo "firefox|Firefox|não pede senha; o mais simples"
+    any_dir "$h/.config/google-chrome" "$h/.var/app/com.google.Chrome" && echo "chrome|Google Chrome|pode pedir a senha do chaveiro"
+    any_dir "$h/.config/chromium" "$h/snap/chromium/common/chromium" "$h/.var/app/org.chromium.Chromium" && echo "chromium|Chromium|pode pedir a senha do chaveiro"
+    any_dir "$h/.config/BraveSoftware/Brave-Browser" "$h/.var/app/com.brave.Browser" && echo "brave|Brave|pode pedir a senha do chaveiro"
+    any_dir "$h/.config/microsoft-edge" && echo "edge|Microsoft Edge|pode pedir a senha do chaveiro"
+    any_dir "$h/.config/vivaldi" && echo "vivaldi|Vivaldi|pode pedir a senha do chaveiro"
+    any_dir "$h/.config/opera" && echo "opera|Opera|pode pedir a senha do chaveiro"
+    return 0
+}
+
+cookie_label() { local b; b="$(pref_get cookies)"; if [ -n "$b" ]; then printf '%s' "$b"; else printf 'desligado'; fi; }
+
+cookie_test() {   # navegador -> lê os cookies (sem acessar nenhum site) e guarda o resultado em $WORKD/cookietest
+    "$YTDLP" --cookies-from-browser "$1" --simulate --no-warnings --socket-timeout 3 \
+        "http://127.0.0.1:9/zapt-teste.mp4" >"$WORKD/cookietest" 2>&1 </dev/null
+    return 0
+}
+
+flow_cookies() {   # rc 0 = ficou configurado (ou desligado de propósito)
+    local rows b n err
+    mkwork
+    rows="$(detect_browsers)"
+    if [ -z "$rows" ]; then
+        ui_info "Não encontrei perfil de nenhum navegador compatível (Firefox, Chrome, Chromium, Brave, Edge, Vivaldi ou Opera) nesta conta."
+        return 1
+    fi
+    rows+=$'\noff|Não usar cookies|volta ao normal'
+    b="$(printf '%s\n' "$rows" | ui_choose "Zapt: cookies do navegador" "Cookies deixam o Zapt acessar vídeos que exigem login (restrição de idade, só para membros, verificação do YouTube), usando a sua sessão já logada no navegador.
+
+Qual navegador usar?" "$(pref_get cookies)" "Navegador" "Observação")" || return 1
+    if [ "$b" = off ]; then
+        pref_set cookies ""
+        apply_cookies
+        ui_info "Cookies desligados."
+        return 0
+    fi
+    ui_confirm "Usar os cookies do navegador \"$b\"?
+
+• Os cookies são lidos só no seu computador e usados nos pedidos do yt-dlp ao site; o Zapt não envia nada para outro lugar.
+• O YouTube pode limitar ou bloquear contas usadas com ferramentas como o yt-dlp. Se puder, deixe o navegador logado numa conta secundária.
+• Se o navegador estiver aberto e der erro, feche-o e tente de novo." "Testar e usar" "Cancelar" n || return 1
+    : >"$WORKD/cookietest"
+    RUN_KIND=pulse ui_run "Lendo os cookies do $b…" cookie_test "$b"
+    [ $? -eq 130 ] && return 1
+    n="$(grep -aoE 'Extracted [0-9]+ cookies' "$WORKD/cookietest" | grep -aoE '[0-9]+' | head -n1)"
+    if [ -n "$n" ] && [ "$n" -gt 0 ]; then
+        pref_set cookies "$b"
+        apply_cookies
+        ui_info "Pronto: li $n cookies do $b e vou usá-los nos downloads.
+
+Dá para desligar em Mais opções > Preferências > Cookies do navegador."
+        return 0
+    fi
+    err="$(grep -a 'ERROR' "$WORKD/cookietest" | head -n1 | cut -c1-300)"
+    ui_info "Não consegui ler os cookies do $b${err:+:
+$err}
+
+Se o navegador estiver aberto, feche-o e tente de novo. No Chrome e parecidos, o Zapt pode precisar da senha do chaveiro do sistema."
+    return 1
+}
+
+# O erro parece de "precisa estar logado"? (olha a saída do último yt-dlp)
+needs_login_err() {
+    cat "$WORKD/lasterr" "$WORKD/xerr" 2>/dev/null |
+        grep -aqiE "sign in to confirm|confirm your age|age-restricted|age restricted|members-only|members only|join this channel|login required|sign in if you.ve been granted|this video is private|private video|cookies"
+}
+
+offer_cookies() {   # depois de uma falha: oferece usar cookies. rc 0 = configurou, vale tentar de novo
+    [ -z "$(pref_get cookies)" ] || return 1
+    needs_login_err || return 1
+    ui_confirm "Este vídeo parece exigir login (restrição de idade, vídeo só para membros, privado ou verificação do YouTube).
+
+Quer usar os cookies do seu navegador, onde você já está logado, e tentar de novo?" "Usar cookies…" "Não" || return 1
+    flow_cookies || return 1
+    [ -n "$(pref_get cookies)" ]
+}
+
 onoff() {   # chave padrão(on|off) -> "ligado"/"desligado"
     if [ "$(pref_get "$1" "$2")" = on ]; then printf 'ligado'; else printf 'desligado'; fi
 }
@@ -916,6 +1251,53 @@ $(prefs_summary | tail -n1)
 Para voltar a lembrar sempre a última escolha, mude em \"Escolhas de formato e qualidade\"."
 }
 
+short_path() { local p="$1"; printf '%s' "${p/#$HOME/~}"; }
+
+flow_files() {
+    local c d n
+    while true; do
+        c="$(ui_menu "Zapt: pastas e nomes dos arquivos" "Onde salvar e como nomear o que você baixa." Voltar <<EOF
+dirm|Pasta das músicas: $(short_path "$(dest_for musica)")
+dirv|Pasta dos vídeos: $(short_path "$(dest_for video)")
+ask|Perguntar a pasta a cada download: $(onoff dest_ask off)
+padrao|Voltar às pastas padrão do sistema
+nome|Nome dos arquivos: $(name_label)
+meta|Música: limpar o título e separar artista: $(onoff meta_clean off)
+EOF
+)" || return 0
+        case "$c" in
+            dirm | dirv)
+                d="$(ui_pick_dir "Escolha a pasta" "$(dest_for "$([ "$c" = dirm ] && echo musica || echo video)")")" || continue
+                [ -n "$d" ] || continue
+                pref_set "dir_$([ "$c" = dirm ] && echo musica || echo video)" "$d"
+                ;;
+            ask) toggle_pref dest_ask off ;;
+            padrao)
+                pref_del_prefix dir_
+                ui_info "Pronto: músicas e vídeos voltam para as pastas padrão do sistema."
+                ;;
+            nome)
+                n="$(printf '%s\n' \
+                    'titulo|Título|Meu Vídeo.mp4' \
+                    'artista|Artista - Título|Banda - Música.mp3 (usa o artista da faixa ou o canal)' \
+                    'canal|Canal - Título|Canal - Meu Vídeo.mp4' \
+                    'data|Data - Título|2026-10-22 - Meu Vídeo.mp4 (ajuda a organizar por data)' |
+                    ui_choose "Zapt: nome dos arquivos" "Como nomear os arquivos baixados?" "$(pref_get name_tpl titulo)" "Modelo" "Exemplo")" &&
+                    pref_set name_tpl "$n"
+                ;;
+            meta)
+                toggle_pref meta_clean off
+                if [ "$(pref_get meta_clean off)" = on ]; then
+                    [ "$(pref_get name_tpl titulo)" = titulo ] && pref_set name_tpl artista
+                    ui_info "Ligado. Nas músicas, o Zapt tira \"(Official Video)\", \"[Lyrics]\" e parecidos do título e, quando o título for \"Artista - Música\", separa os dois nas etiquetas do arquivo.
+
+Deixei o nome dos arquivos como \"Artista - Título\", para o nome continuar com o artista. Dá para mudar em \"Nome dos arquivos\"."
+                fi
+                ;;
+        esac
+    done
+}
+
 flow_prefs() {
     local c m
     while true; do
@@ -923,9 +1305,12 @@ flow_prefs() {
 
 O que você quer ajustar?" Voltar <<EOF
 memoria|Escolhas de formato e qualidade: $(mem_label)
+arquivos|Pastas e nomes dos arquivos…
+cookies|Cookies do navegador (vídeos com login): $(cookie_label)
 fixar|Usar as minhas últimas escolhas como padrão fixo
 esquecer|Esquecer as escolhas guardadas
 aviso|Aviso de versão nova do yt-dlp: $(onoff update_check on)
+avisoapp|Aviso de versão nova do Zapt: $(onoff app_update_check on)
 hw|Aceleração por hardware na conversão: $(onoff hw off)
 EOF
 )" || return 0
@@ -938,6 +1323,8 @@ EOF
                     ui_choose "Zapt: preferências" "Como o Zapt deve escolher o formato e a qualidade de antemão?" "$(pref_get memory last)" "Modo" "Como funciona")" &&
                     pref_set memory "$m"
                 ;;
+            arquivos) flow_files ;;
+            cookies) flow_cookies ;;
             fixar) fix_defaults ;;
             esquecer)
                 if ui_confirm "Esquecer o formato e a qualidade guardados (a última escolha e o padrão fixo)?" "Esquecer" "Cancelar" n; then
@@ -947,6 +1334,7 @@ EOF
                 fi
                 ;;
             aviso) toggle_pref update_check on ;;
+            avisoapp) toggle_pref app_update_check on ;;
             hw) flow_hw_pref ;;
         esac
     done
@@ -1081,7 +1469,7 @@ apply_clip_args() {
     YARGS+=(--download-sections "*$(num_g "$CLIP_S")-$end" --force-keyframes-at-cuts)
     for ((i = 0; i < ${#YARGS[@]}; i++)); do
         if [ "${YARGS[$i]}" = "-o" ]; then
-            YARGS[$((i + 1))]="%(title)s (trecho $CLIP_TAG).%(ext)s"
+            YARGS[$((i + 1))]="${YARGS[$((i + 1))]%".%(ext)s"} (trecho $CLIP_TAG).%(ext)s"
             break
         fi
     done
@@ -1200,7 +1588,8 @@ pick_audio() {
             SEL_LABEL="${af^^} · ${aq} kbps"
             SEL_BYTES="$(audio_est "$aq")" ;;
     esac
-    YARGS+=(--embed-metadata --no-playlist -o "%(title)s.%(ext)s" --trim-filenames 180 -P "$DEST")
+    meta_args
+    YARGS+=(--embed-metadata "${META_ARGS[@]}" --no-playlist -o "$(name_tpl).%(ext)s" --trim-filenames 180 -P "$DEST")
     return 0
 }
 
@@ -1236,7 +1625,7 @@ pick_video() {
         SEL_LABEL="melhor qualidade disponível (MP4)"
         SEL_BYTES=""
         YARGS=(-f "bv*+ba/b" --merge-output-format mp4 --embed-metadata --no-playlist \
-            -o "%(title)s.%(ext)s" --trim-filenames 180 -P "$DEST")
+            -o "$(name_tpl).%(ext)s" --trim-filenames 180 -P "$DEST")
         return 0
     fi
     while true; do
@@ -1259,7 +1648,7 @@ pick_video() {
     sel="$vv${va:+"+$va"}"
     SEL_LABEL="${c^^} · $lab"
     YARGS=(-f "$sel/bv*[height<=$h]+ba/b[height<=$h]" --merge-output-format "$c" --remux-video "$c" \
-        --embed-metadata --no-playlist -o "%(title)s.%(ext)s" --trim-filenames 180 -P "$DEST")
+        --embed-metadata --no-playlist -o "$(name_tpl).%(ext)s" --trim-filenames 180 -P "$DEST")
     # Plano B se der erro (ex.: 403 numa faixa de áudio): mantém o MESMO vídeo e deixa o yt-dlp
     # escolher o áudio sozinho (ele prefere a faixa original); sem áudio separado, tudo automático.
     case "$c" in mp4) asel="ba[ext=m4a]/ba" ;; webm) asel="ba[ext=webm]/ba" ;; *) asel="ba" ;; esac
@@ -1296,36 +1685,25 @@ subs_avail() {   # $1 = prefixo do idioma (pt, en) -> m (do autor) | a (automát
 subs_note() {   # prefixo -> texto curto
     case "$(subs_avail "$1")" in
         m) printf 'legenda feita pelo autor' ;;
-        a) printf 'só legenda automática (pode ter erros)' ;;
+        a) printf 'só automática: será ignorada (evita bloqueio 429)' ;;
         n) printf 'não encontrei neste vídeo' ;;
-        *) printf 'se o vídeo tiver' ;;
+        *) printf 'só se for feita pelo autor' ;;
     esac
 }
 
-subs_expr() {   # pt | en | pten | other:es,fr  ->  "pt.*,en.*"
-    local c="${1#other:}" out="" x
+subs_prefixes() {   # pt | en | pten | other:es,fr -> um prefixo por linha
     case "$1" in
-        pt) echo 'pt.*' ; return ;;
-        en) echo 'en.*' ; return ;;
-        pten) echo 'pt.*,en.*' ; return ;;
-    esac
-    c="$(printf '%s' "$c" | tr -cd 'A-Za-z,-')"
-    local IFS=,
-    for x in $c; do [ -n "$x" ] && out="${out:+$out,}$x.*"; done
-    printf '%s' "$out"
-}
-subs_name() {
-    case "$1" in
-        pt) echo 'português' ;;
-        en) echo 'inglês' ;;
-        pten) echo 'português e inglês' ;;
-        other:*) echo "${1#other:}" ;;
+        pt) echo pt ;;
+        en) echo en ;;
+        pten) printf 'pt\nen\n' ;;
+        other:*) printf '%s' "${1#other:}" | tr ',' '\n' | tr 'A-Z' 'a-z' | grep -v '^$' ;;
     esac
 }
 
+SUBS_NOTE=""
 pick_subs() {   # depois de pick_video: acrescenta as opções de legenda em YARGS. rc 1 = voltar
-    local c d m mdef codes ex expr cont
-    PICK_SUBS=""; PICK_SMODE=""
+    local c d m mdef ex expr cont p keep="" nauto=0 nnone=0
+    PICK_SUBS=""; PICK_SMODE=""; SUBS_NOTE=""
     [ "$CLIP_ON" = 1 ] && return 0           # com recorte as legendas não acompanham o trecho
     [ -n "$PICK_VCONT" ] || return 0         # sem detalhes de qualidade, não mexe
     d="$(pref_default subs)"; mdef="$(pref_default subs_mode)"
@@ -1334,11 +1712,13 @@ pick_subs() {   # depois de pick_video: acrescenta as opções de legenda em YAR
         "none|Sem legendas|só o vídeo" \
         "pt|Português|$(subs_note pt)" \
         "en|Inglês|$(subs_note en)" \
-        "pten|Português e inglês|baixa as duas" \
+        "pten|Português e inglês|só as feitas pelo autor" \
         "other|Outro idioma…|você digita o código (es, fr, ja…)" |
         ui_choose "Vídeo — legendas" "$(info_text)
 
-Quer baixar legendas junto com o vídeo?" "${d:-none}" "Legendas" "Situação neste vídeo")" || return 1
+Só baixo legendas feitas pelo autor do vídeo. As automáticas (geradas ou traduzidas pelo YouTube) são ignoradas, porque o YouTube costuma bloquear esses pedidos (erro 429).
+
+Quer legendas junto com o vídeo?" "${d:-none}" "Legendas" "Situação neste vídeo")" || return 1
     if [ "$c" = other ]; then
         ex="$(ui_entry "Legendas" "Código(s) do idioma, separados por vírgula (exemplos: es  ou  es,fr  ou  ja):" "${ex:-es}")" || return 1
         ex="$(printf '%s' "$ex" | tr -cd 'A-Za-z,-')"
@@ -1347,44 +1727,126 @@ Quer baixar legendas junto com o vídeo?" "${d:-none}" "Legendas" "Situação ne
     fi
     PICK_SUBS="$c"
     [ "$c" = none ] && return 0
+    # só entram idiomas com legenda do autor (ou, em lote, qualquer um: cada vídeo tem o seu caso)
+    while IFS= read -r p; do
+        case "$(subs_avail "$p")" in
+            m | '?') keep="${keep:+$keep,}$p.*" ;;
+            a) nauto=$((nauto + 1)) ;;
+            *) nnone=$((nnone + 1)) ;;
+        esac
+    done < <(subs_prefixes "$c")
+    if [ "$nauto" -gt 0 ]; then
+        SUBS_NOTE="Legenda automática ignorada para prevenir bloqueio do YouTube (erro 429); o vídeo foi baixado com sucesso."
+    elif [ -z "$keep" ] && [ "$nnone" -gt 0 ]; then
+        SUBS_NOTE="Este vídeo não tem legenda do autor no idioma escolhido; o vídeo foi baixado sem legenda."
+    fi
+    if [ -z "$keep" ]; then
+        SEL_LABEL="$SEL_LABEL · sem legendas (só havia automática)"
+        [ "$nauto" -eq 0 ] && SEL_LABEL="$SEL_LABEL · sem legendas (não há do autor)"
+        return 0
+    fi
     m="$(printf '%s\n' \
         "embed|Embutida no vídeo|aparece no player; dá para ligar e desligar" \
         "file|Arquivo .srt separado|fica ao lado do vídeo, com o mesmo nome" |
         ui_choose "Vídeo — legendas" "Como guardar as legendas?" "${mdef:-embed}" "Modo" "Resultado")" || return 1
     PICK_SMODE="$m"
-    expr="$(subs_expr "$c")"
-    YARGS+=(--write-subs --write-auto-subs --sub-langs "$expr")
+    expr="$keep"
+    YARGS+=(--write-subs --sleep-subtitles 2 --sub-langs "$expr")
     cont="${PICK_VCONT:-mp4}"
     if [ "$m" = embed ]; then
         YARGS+=(--embed-subs)
         [ "$cont" = webm ] && YARGS+=(--sub-format "vtt/best") || YARGS+=(--convert-subs srt)
-        SEL_LABEL="$SEL_LABEL · legendas: $(subs_name "$c") (embutidas)"
+        SEL_LABEL="$SEL_LABEL · legendas do autor (embutidas)"
     else
         YARGS+=(--convert-subs srt)
-        SEL_LABEL="$SEL_LABEL · legendas: $(subs_name "$c") (arquivo .srt)"
+        SEL_LABEL="$SEL_LABEL · legendas do autor (arquivo .srt)"
     fi
+    [ "$nauto" -gt 0 ] && SEL_LABEL="$SEL_LABEL; automática ignorada"
     return 0
+}
+
+# Cópia de YARGS sem as opções de legenda -> NOSUBS (para tentar de novo só com o vídeo)
+yargs_has_subs() { local a; for a in "${YARGS[@]}"; do [ "$a" = --write-subs ] && return 0; done; return 1; }
+strip_subs() {
+    local i=0 a
+    NOSUBS=()
+    while [ "$i" -lt "${#YARGS[@]}" ]; do
+        a="${YARGS[$i]}"
+        case "$a" in
+            --write-subs | --write-auto-subs | --embed-subs) ;;
+            --sub-langs | --convert-subs | --sub-format | --sleep-subtitles) i=$((i + 1)) ;;
+            *) NOSUBS+=("$a") ;;
+        esac
+        i=$((i + 1))
+    done
 }
 
 # ydl_try URL [argumentos extras]: baixa com YARGS; se falhar e houver plano B (YFALLBACK),
 # tenta mais uma vez com ele (o que já foi baixado é reaproveitado pelo yt-dlp).
-ydl_try() {
+# Roda o yt-dlp guardando só o stderr (para saber o motivo da falha) sem atrapalhar a barra de progresso
+yt_run() {
+    local rc
+    "$YTDLP" "${FFARGS[@]}" "$@" </dev/null 2> >(tee "$WORKD/lasterr" >&2)
+    rc=$?
+    sleep 0.3   # dá tempo do tee terminar de gravar
+    return $rc
+}
+
+# Erro que costuma passar sozinho (limite de pedidos, queda de rede, 5xx)? Erros definitivos não entram.
+transient_err() {
+    [ -s "$WORKD/lasterr" ] || return 1
+    if grep -aqiE 'sign in to confirm|private video|video unavailable|not available in your country|members-only|age-restricted|has been removed|copyright|requested format is not available' "$WORKD/lasterr"; then
+        return 1
+    fi
+    grep -aqiE 'HTTP Error (403|429|5[0-9][0-9])|too many requests|timed out|connection reset|connection aborted|temporary failure|unable to connect|incompleteread|EOF occurred|remote end closed|name resolution' "$WORKD/lasterr"
+}
+
+# Uma rodada: formato escolhido -> plano B de formato -> só o vídeo, sem legendas
+ydl_once() {
     local url="$1" nl=() rc fb=()
     shift
     [ "$UI" = gui ] && nl=(--newline)
-    "$YTDLP" "${FFARGS[@]}" "${nl[@]}" "${YARGS[@]}" "$@" \
-        --print-to-file "after_move:filepath" "$SAVED" "$url" </dev/null
+    yt_run "${nl[@]}" "${YARGS[@]}" "$@" --print-to-file "after_move:filepath" "$SAVED" "$url"
     rc=$?
     if [ "$rc" -ne 0 ] && [ -n "$YFALLBACK" ]; then
         printf '\nA primeira tentativa falhou; tentando de outro jeito...\n'
         [ "${RUN_KIND:-}" = dl ] && printf '%s' "Tentando de outro jeito…" >"$WORKD/runtext"
         fb=("${YARGS[@]}")
         fb[1]="$YFALLBACK"
-        "$YTDLP" "${FFARGS[@]}" "${nl[@]}" "${fb[@]}" "$@" \
-            --print-to-file "after_move:filepath" "$SAVED" "$url" </dev/null
+        yt_run "${nl[@]}" "${fb[@]}" "$@" --print-to-file "after_move:filepath" "$SAVED" "$url"
         rc=$?
     fi
+    if [ "$rc" -ne 0 ] && yargs_has_subs; then
+        printf '\nNão consegui as legendas (o YouTube pode ter limitado os pedidos). Baixando só o vídeo...\n'
+        [ "${RUN_KIND:-}" = dl ] && printf '%s' "Baixando só o vídeo…" >"$WORKD/runtext"
+        strip_subs
+        yt_run "${nl[@]}" "${NOSUBS[@]}" "$@" --print-to-file "after_move:filepath" "$SAVED" "$url"
+        rc=$?
+        [ "$rc" -eq 0 ] && printf '%s\n' "$url" >>"$WORKD/subslost"
+    fi
     return $rc
+}
+
+# Baixa com até 3 rodadas: se o erro for passageiro (403, 429, rede), espera e tenta de novo sozinho.
+ydl_try() {
+    local n=1 max=3 rc pause prev
+    local -a pauses
+    read -r -a pauses <<<"${ZAPT_RETRY_PAUSE:-5 15}"
+    : >"$WORKD/lasterr"
+    while true; do
+        ydl_once "$@"
+        rc=$?
+        [ "$rc" -eq 0 ] && return 0
+        [ "$n" -ge "$max" ] && return "$rc"
+        transient_err || return "$rc"
+        pause="${pauses[$((n - 1))]:-15}"
+        n=$((n + 1))
+        printf '\nErro passageiro do site. Tentando de novo em %ss (tentativa %s de %s)...\n' "$pause" "$n" "$max"
+        prev="$(cat "$WORKD/runtext" 2>/dev/null)"
+        case "${RUN_KIND:-}" in dl | dlq) printf '%s' "Erro passageiro; nova tentativa em ${pause}s ($n de $max)…" >"$WORKD/runtext" ;; esac
+        sleep "$pause"
+        [ -n "$prev" ] && printf '%s' "$prev" >"$WORKD/runtext"
+    done
 }
 
 download_job() { ydl_try "$DL_URL"; }
@@ -1405,7 +1867,7 @@ expand_job() {
         [ "$NLINKS" -eq 1 ] && msg="Buscando informações do link…"
         printf '%s' "$msg" >"$WORKD/runtext"
         if ! "$YTDLP" "${FFARGS[@]}" --flat-playlist --no-playlist --no-warnings -J "$u" \
-            >"$WORKD/x$i.json" </dev/null; then
+            >"$WORKD/x$i.json" </dev/null 2> >(tee -a "$WORKD/xerr" >&2); then
             printf '%s\n' "$u" >>"$WORKD/xfail.txt"
             rm -f "$WORKD/x$i.json"
         fi
@@ -1458,9 +1920,32 @@ Se for do YouTube e o erro for 403 ou de acesso, use Mais opções > Atualizar p
 }
 
 # Baixa os itens de QSEL, um de cada vez, com as opções já escolhidas em YARGS
+# ---- fila pendente: guarda o que falta baixar para retomar depois ----
+QUEUE_FILE="$DATA_DIR/fila-pendente.sh"
+QMODE=""; RESUMED=0
+Q_MODE=""; Q_DEST=""; Q_LABEL=""; Q_YARGS=(); Q_URL=(); Q_TITLE=(); Q_GROUP=()
+
+queue_save_pending() {   # $1 = arquivo com os índices já baixados (um por linha); apaga se nada falta
+    local i keep=() tmp="$QUEUE_FILE.new"
+    for i in "${QSEL[@]}"; do
+        grep -qx "$i" "$1" 2>/dev/null || keep+=("$i")
+    done
+    if [ "${#keep[@]}" -eq 0 ]; then rm -f "$QUEUE_FILE" "$tmp"; return 0; fi
+    mkdir -p "$DATA_DIR"
+    {
+        printf 'Q_MODE=%q\nQ_DEST=%q\nQ_LABEL=%q\n' "$QMODE" "$DEST" "$SEL_LABEL"
+        printf 'Q_YARGS=('; printf '%q ' "${YARGS[@]}"; printf ')\n'
+        printf 'Q_URL=('; for i in "${keep[@]}"; do printf '%q ' "${ITEM_URL[$i]}"; done; printf ')\n'
+        printf 'Q_TITLE=('; for i in "${keep[@]}"; do printf '%q ' "${ITEM_TITLE[$i]}"; done; printf ')\n'
+        printf 'Q_GROUP=('; for i in "${keep[@]}"; do printf '%q ' "${ITEM_GROUP[$i]}"; done; printf ')\n'
+    } >"$tmp" && mv -f "$tmp" "$QUEUE_FILE"
+}
+
 queue_job() {
     local i k=0 n="${#QSEL[@]}" grp=()
     : >"$WORKD/qfail.txt"
+    : >"$WORKD/qdone.txt"
+    queue_save_pending "$WORKD/qdone.txt"
     for i in "${QSEL[@]}"; do
         k=$((k + 1))
         echo "$k/$n" >"$WORKD/stage"
@@ -1468,9 +1953,62 @@ queue_job() {
         printf '\n[[ITEM %s/%s]] %s\n' "$k" "$n" "${ITEM_TITLE[$i]}"
         grp=()
         [ -n "${ITEM_GROUP[$i]}" ] && grp=(-P "$DEST/${ITEM_GROUP[$i]}")
-        ydl_try "${ITEM_URL[$i]}" "${grp[@]}" || printf '%s\n' "${ITEM_TITLE[$i]}" >>"$WORKD/qfail.txt"
+        if ydl_try "${ITEM_URL[$i]}" "${grp[@]}"; then
+            printf '%s\n' "$i" >>"$WORKD/qdone.txt"
+            queue_save_pending "$WORKD/qdone.txt"
+        else
+            printf '%s\n' "${ITEM_TITLE[$i]}" >>"$WORKD/qfail.txt"
+        fi
     done
     return 0
+}
+
+# Carrega a fila guardada (variáveis Q_*). rc 1 = não há fila válida.
+queue_load_pending() {
+    [ -s "$QUEUE_FILE" ] || return 1
+    Q_MODE=""; Q_DEST=""; Q_LABEL=""; Q_YARGS=(); Q_URL=(); Q_TITLE=(); Q_GROUP=()
+    # shellcheck disable=SC1090
+    . "$QUEUE_FILE" 2>/dev/null || { rm -f "$QUEUE_FILE"; return 1; }
+    if [ "${#Q_URL[@]}" -eq 0 ] || [ "${#Q_URL[@]}" -ne "${#Q_TITLE[@]}" ]; then rm -f "$QUEUE_FILE"; return 1; fi
+    return 0
+}
+
+resume_queue() {
+    local i n="${#Q_URL[@]}"
+    mkwork
+    ITEM_URL=("${Q_URL[@]}"); ITEM_TITLE=("${Q_TITLE[@]}"); ITEM_GROUP=("${Q_GROUP[@]}")
+    ITEM_DUR=(); ITEM_SRC=(); QSEL=()
+    for ((i = 0; i < n; i++)); do QSEL+=("$i"); done
+    YARGS=("${Q_YARGS[@]}"); YFALLBACK=""
+    DEST="$Q_DEST"; SEL_LABEL="$Q_LABEL"; SEL_BYTES=""; QMODE="$Q_MODE"
+    SAVED="$WORKD/saved.txt"
+    : >"$SAVED"; : >"$WORKD/subslost"
+    RESUMED=1
+    batch_download
+    RESUMED=0
+}
+
+RESUME_ASKED=0
+resume_notice() {   # ao abrir: se ficou fila pela metade, pergunta o que fazer (uma vez por sessão)
+    local c n list
+    [ "$RESUME_ASKED" = 0 ] || return 0
+    RESUME_ASKED=1
+    queue_load_pending || return 0
+    n="${#Q_URL[@]}"
+    list="$(printf '%s\n' "${Q_TITLE[@]:0:4}" | sed 's/^/ • /')"
+    [ "$n" -gt 4 ] && list+="
+  …e mais $((n - 4))."
+    c="$(ui_menu "Zapt" "Ficou uma fila de downloads sem terminar ($n item(ns)): foi cancelada, teve erro ou o computador desligou.
+
+$list" "Agora não" <<'EOF'
+continuar|Continuar de onde parou
+descartar|Descartar essa fila
+EOF
+)" || return 0
+    case "$c" in
+        continuar) resume_queue ;;
+        descartar) rm -f "$QUEUE_FILE" ;;
+    esac
 }
 
 batch_download() {   # depois do queue_job: mostra o resumo
@@ -1485,23 +2023,35 @@ batch_download() {   # depois do queue_job: mostra o resumo
         done <"$SAVED"
     fi
     if [ "$rc" -eq 130 ]; then
-        ui_info "Cancelado. Os $nsaved itens que já tinham sido baixados continuam em: $DEST"
+        ui_info "Cancelado. Os $nsaved itens que já tinham sido baixados continuam em: $DEST
+
+O que faltou ficou guardado: na próxima vez que abrir o Zapt, ele pergunta se você quer continuar."
         return 0
     fi
     if [ "$nfail" -eq 0 ]; then
-        text="Pronto! $n itens baixados."
+        if [ "$n" -eq 1 ]; then text="Pronto! 1 item baixado."; else text="Pronto! $n itens baixados."; fi
     else
         text="Pronto! $((n - nfail)) de $n itens baixados."
     fi
     est="$(scale_b "${SEL_BYTES:-0}")"
     text+="
 Tamanho total: $(fmt_mb "$total")"
-    if [ "$nfail" -eq 0 ] && [ "$nsaved" -eq "$n" ]; then
+    if [ "$RESUMED" != 1 ] && [ "$nfail" -eq 0 ] && [ "$nsaved" -eq "$n" ]; then
         text+="$(size_diff "$est" "$total")"
         record_size baixar-lote "$SEL_LABEL ($n itens)" "$est" "$total"
     fi
     text+="
 Pasta: $DEST"
+    if yargs_has_subs && [ ! -s "$WORKD/subslost" ]; then
+        text+="
+
+Legendas: só as feitas pelo autor são baixadas; vídeos sem elas ficam sem legenda (as automáticas são ignoradas para evitar o erro 429)."
+    fi
+    if [ -s "$WORKD/subslost" ]; then
+        text+="
+
+Atenção: em $(grep -c . "$WORKD/subslost") item(ns) não consegui as legendas (o YouTube limitou os pedidos, erro 429), então eles foram salvos sem legenda. Tente de novo mais tarde."
+    fi
     if [ "$nfail" -gt 0 ]; then
         text+="
 
@@ -1511,8 +2061,8 @@ $(head -n 10 "$WORKD/qfail.txt" | sed 's/^/ • /')"
   …e mais $((nfail - 10))."
         text+="
 
-DICA: erros 403 do YouTube costumam ser passageiros; tente de novo.
-Se persistir, use Mais opções > Atualizar para a versão nightly."
+Eles ficaram guardados: na próxima vez que abrir o Zapt, ele pergunta se você quer tentar de novo.
+Se o erro for 403 e persistir, use Mais opções > Atualizar para a versão nightly."
     fi
     ui_info "$text"
 }
@@ -1520,7 +2070,7 @@ Se persistir, use Mais opções > Atualizar para a versão nightly."
 download_main() {   # $1 = musica|video (vazio = pergunta)
     local mode="${1:-}" txt rc text n i first tries nfail note mult real est clip_line
     mkwork
-    SIZE_MULT=1; BATCH_N=1
+    SIZE_MULT=1; BATCH_N=1; SUBS_NOTE=""
 
     txt="$(ui_links "Cole o link do vídeo ou da música. Dá para colar vários links (um por linha) e também links de playlist.")" || return 0
     printf '%s\n' "$txt" | links_from_text >"$WORKD/links.list"
@@ -1531,10 +2081,17 @@ download_main() {   # $1 = musica|video (vazio = pergunta)
             ui_choose "Zapt" "O que você quer baixar?" musica "Tipo" "Detalhes")" || return 0
     fi
 
+    : >"$WORKD/xerr"; : >"$WORKD/lasterr"
     RUN_KIND=pulse ui_run "Lendo o link…" expand_job
     rc=$?
     [ "$rc" -eq 130 ] && return 0
     build_items
+    if [ "${#ITEM_URL[@]}" -eq 0 ] && offer_cookies; then
+        RUN_KIND=pulse ui_run "Lendo o link…" expand_job
+        rc=$?
+        [ "$rc" -eq 130 ] && return 0
+        build_items
+    fi
     nfail="$(wc -l <"$WORKD/xfail.txt")"
     if [ "${#ITEM_URL[@]}" -eq 0 ]; then
         fail_read
@@ -1594,6 +2151,10 @@ $(sed 's/^/ • /' "$WORKD/xfail.txt")"
     fi
 
     DEST="$(dest_for "$mode")"
+    if [ "$(pref_get dest_ask off)" = on ]; then
+        DEST="$(ui_pick_dir "Onde salvar?" "$DEST")" || return 0
+        [ -n "$DEST" ] || return 0
+    fi
     note=""
     for i in "${QSEL[@]}"; do
         [ -n "${ITEM_GROUP[$i]}" ] && { note=" (playlists em subpastas com o nome da lista)"; break; }
@@ -1631,8 +2192,9 @@ O recorte baixa só esse pedaço, mas pode levar um pouco mais de tempo."
     remember_picks "$mode"
 
     SAVED="$WORKD/saved.txt"
-    : >"$SAVED"
+    : >"$SAVED"; : >"$WORKD/subslost"
     if [ "$n" -gt 1 ]; then
+        QMODE="$mode"
         batch_download
         return 0
     fi
@@ -1641,6 +2203,11 @@ O recorte baixa só esse pedaço, mas pode levar um pouco mais de tempo."
     RUN_KIND=dl ui_run "Baixando…" download_job
     rc=$?
     [ "$rc" -eq 130 ] && return 0
+    if [ "$rc" -ne 0 ] && offer_cookies; then
+        RUN_KIND=dl ui_run "Baixando…" download_job
+        rc=$?
+        [ "$rc" -eq 130 ] && return 0
+    fi
     if [ "$rc" -ne 0 ]; then
         ui_fail "Zapt: erro ao baixar" "DICA: erros 403 do YouTube costumam ser passageiros. Tente de novo.
 Se persistir, volte ao menu e use: Mais opções > Atualizar para a versão nightly."
@@ -1655,7 +2222,7 @@ Se persistir, volte ao menu e use: Mais opções > Atualizar para a versão nigh
 
 $(basename "$LAST_FILE")
 Tamanho final: $(fmt_mb "$real")$(size_diff "$est" "$real")
-Pasta: $(dirname "$LAST_FILE")
+Pasta: $(dirname "$LAST_FILE")$([ -n "$SUBS_NOTE" ] && printf '\n\n%s' "$SUBS_NOTE")$([ -s "$WORKD/subslost" ] && printf '\n\nAtenção: não consegui as legendas (o YouTube limitou os pedidos, erro 429).\nO vídeo foi salvo sem elas; tente de novo mais tarde.')
 
 Quer converter para compartilhar (Discord, WhatsApp...)?" "Converter…" "Fechar" n; then
             flow_convert "$LAST_FILE"
@@ -1770,6 +2337,7 @@ fits_already() {   # vídeo: já é MP4/H.264/AAC e já cabe no limite ($1 em MB
 fits_already_audio() {
     is_pos "$1" || return 1
     [ "$CLIP_ON" = 1 ] && return 1
+    [ "${AF_MODE:-none}" = none ] || return 1
     [ "$P_KIND" = audio ] && [ "$P_ACODEC" = mp3 ] || return 1
     awk -v s="$P_SIZE" -v l="$1" 'BEGIN { exit !(s <= l * 1e6 * 0.98) }'
 }
@@ -1967,6 +2535,41 @@ Confira com: vainfo"
     ui_info "$msg"
 }
 
+# Ajustes de áudio na conversão de música: normalizar volume e/ou cortar silêncio do começo e do fim
+AF_MODE="none"; AF_ARGS=()
+af_build() {
+    local chain=""
+    AF_ARGS=()
+    case "$AF_MODE" in sil | both)
+        chain="silenceremove=start_periods=1:start_duration=0.02:start_threshold=-50dB:start_silence=0.1,areverse,silenceremove=start_periods=1:start_duration=0.02:start_threshold=-50dB:start_silence=0.1,areverse" ;;
+    esac
+    case "$AF_MODE" in norm | both)
+        chain="${chain:+$chain,}loudnorm=I=-16:TP=-1.5:LRA=11" ;;
+    esac
+    [ -n "$chain" ] && AF_ARGS=(-af "$chain" -ar 44100)
+    return 0
+}
+af_desc() {
+    case "$AF_MODE" in
+        norm) printf ' · volume normalizado' ;;
+        sil) printf ' · sem silêncio no começo e no fim' ;;
+        both) printf ' · volume normalizado · sem silêncio no começo e no fim' ;;
+    esac
+}
+ask_audio_adjust() {   # rc 1 = voltar
+    local a
+    a="$(printf '%s\n' \
+        'none|Sem ajustes|converte como está' \
+        'norm|Normalizar o volume|deixa tudo no mesmo volume (bom para músicas de fontes diferentes e podcasts)' \
+        'sil|Cortar o silêncio do começo e do fim|tira os segundos mudos das pontas' \
+        'both|Os dois|normaliza e corta o silêncio' |
+        ui_choose "Converter para compartilhar" "Quer ajustar o áudio?" "$(pref_get last_aadj none)" "Ajuste" "O que faz")" || return 1
+    AF_MODE="$a"
+    pref_remember aadj "$a"
+    af_build
+    return 0
+}
+
 encode_audio() {   # entrada saída   (usa PA_K)
     local in="$1" out="$2" tmp extra=()
     tmp="${out%.*}.parcial.mp3"
@@ -1974,18 +2577,19 @@ encode_audio() {   # entrada saída   (usa PA_K)
     echo "1/1" >"$WORKD/stage"
     if [ "$P_KIND" = audio ] && [ -n "$P_PICIDX" ]; then
         # mantém a capa do álbum; se não der, tenta de novo sem ela
-        ff -y "${CLIP_IN[@]}" -i "$in" -map "0:a:0" -map "0:$P_PICIDX" -c:v copy -c:a libmp3lame -b:a "${PA_K}k" "${extra[@]}" \
+        ff -y "${CLIP_IN[@]}" -i "$in" -map "0:a:0" -map "0:$P_PICIDX" -c:v copy -c:a libmp3lame -b:a "${PA_K}k" "${extra[@]}" "${AF_ARGS[@]}" \
             -map_metadata 0 -id3v2_version 3 "$tmp" 2>/dev/null ||
-            ff -y "${CLIP_IN[@]}" -i "$in" -vn -map "0:a:0" -c:a libmp3lame -b:a "${PA_K}k" "${extra[@]}" \
+            ff -y "${CLIP_IN[@]}" -i "$in" -vn -map "0:a:0" -c:a libmp3lame -b:a "${PA_K}k" "${extra[@]}" "${AF_ARGS[@]}" \
                 -map_metadata 0 -id3v2_version 3 "$tmp" || { rm -f "$tmp"; return 1; }
     else
-        ff -y "${CLIP_IN[@]}" -i "$in" -vn -map "0:a:0" -c:a libmp3lame -b:a "${PA_K}k" "${extra[@]}" \
+        ff -y "${CLIP_IN[@]}" -i "$in" -vn -map "0:a:0" -c:a libmp3lame -b:a "${PA_K}k" "${extra[@]}" "${AF_ARGS[@]}" \
             -map_metadata 0 -id3v2_version 3 "$tmp" || { rm -f "$tmp"; return 1; }
     fi
     mv -f "$tmp" "$out"
 }
 
 conv_job() {
+    [ -n "${CONV_LABEL:-}" ] && printf '%s' "$CONV_LABEL" >"$WORKD/runtext"
     if [ "$CV_KIND" = video ]; then encode_video "$CONV_IN" "$CV_OUT"; else encode_audio "$CONV_IN" "$CV_OUT"; fi
 }
 
@@ -1996,7 +2600,7 @@ conv_prepare() {
     if [ "$id" = audio ] || [ "$P_KIND" = audio ]; then
         CV_KIND=audio
         if fits_already_audio "$PR_LIM"; then
-            ui_info "Este arquivo já tem $(fmt_mb "$P_SIZE") e é MP3: já cabe no limite de $PR_LIM MB. Pode enviar como está."
+            [ "${CONV_QUIET:-0}" = 1 ] || ui_info "Este arquivo já tem $(fmt_mb "$P_SIZE") e é MP3: já cabe no limite de $PR_LIM MB. Pode enviar como está."
             return 1
         fi
         plan_audio "$PR_K" "$PR_LIM"
@@ -2007,7 +2611,7 @@ conv_prepare() {
     else
         CV_KIND=video
         if fits_already "$PR_LIM"; then
-            ui_info "Este vídeo já tem $(fmt_mb "$P_SIZE") e já está em MP4/H.264: cabe no limite de $PR_LIM MB. Pode enviar como está."
+            [ "${CONV_QUIET:-0}" = 1 ] || ui_info "Este vídeo já tem $(fmt_mb "$P_SIZE") e já está em MP4/H.264: cabe no limite de $PR_LIM MB. Pode enviar como está."
             return 1
         fi
         plan_video "$PR_LIM"
@@ -2056,6 +2660,8 @@ conv_summary() {
 flow_convert() {   # $1 = arquivo (vazio = abre o seletor de arquivos)
     local f="${1:-}" head preset ans text est_txt lim_txt res
     mkwork
+    : >"$WORKD/lasterr"
+    AF_MODE="none"; af_build
     if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
         ui_info "Para converter é preciso o ffmpeg. Gere o AppImage sem a opção --sem-ffmpeg."
         return 0
@@ -2106,7 +2712,12 @@ $(clip_text)"
             fi
             CUSTOM_LIM="$ans"
         fi
+        AF_MODE="none"; af_build
+        if [ "$preset" = audio ] || [ "$P_KIND" = audio ]; then
+            ask_audio_adjust || continue
+        fi
         conv_prepare "$preset" || continue
+        [ "$CV_KIND" = audio ] && CV_DESC="$CV_DESC$(af_desc)"
 
         if is_pos "$PR_LIM"; then
             lim_txt=" (limite de $PR_LIM MB)"
@@ -2160,6 +2771,162 @@ Dica: no WhatsApp, enviar como Documento permite até 2 GB, sem recompressão."
 }
 
 # ---------------------------------------------------------------------------
+# Converter uma pasta inteira
+# ---------------------------------------------------------------------------
+CONV_QUIET=0; CONV_LABEL=""
+MEDIA_EXT='mp4|mkv|webm|mov|avi|m4v|flv|ts|3gp|mp3|m4a|opus|ogg|flac|wav|aac|wma'
+
+folder_scan_job() {   # lê cada arquivo e escreve "indice|caminho|tipo|duração|bytes" em $WORKD/folder.tsv
+    local i=0 f
+    : >"$WORKD/folder.tsv"
+    for f in "${FOLDER_FILES[@]}"; do
+        printf '%s' "Lendo a pasta… ($((i + 1)) de ${#FOLDER_FILES[@]})" >"$WORKD/runtext"
+        if probe_file "$f" && is_pos "$P_DUR"; then
+            printf '%s|%s|%s|%s|%s\n' "$i" "$f" "$P_KIND" "$P_DUR" "$P_SIZE" >>"$WORKD/folder.tsv"
+        fi
+        i=$((i + 1))
+    done
+}
+
+folder_video_rows() {
+    local id
+    for id in discord discord50 whatsapp social; do
+        preset_info "$id"
+        printf '%s|%s|%s\n' "$id" "$(preset_label "$id")" "$([ "$PR_LIM" -gt 0 ] 2>/dev/null && echo "cada vídeo é reduzido para caber em $PR_LIM MB" || echo "sem limite de tamanho, ótima qualidade")"
+    done
+    printf 'custom|Outro limite de tamanho…|você escolhe o tamanho máximo, em MB\n'
+}
+folder_audio_rows() {
+    local id
+    for id in mp3_192 mp3_128; do preset_info "$id"; printf '%s|%s|MP3 · %s kbps\n' "$id" "$PR_NAME" "$PR_K"; done
+    for id in discord discord50 whatsapp; do
+        preset_info "$id"
+        printf '%s|%s|cada música é ajustada para caber em %s MB\n' "$id" "$(preset_label "$id")" "$PR_LIM"
+    done
+    printf 'custom|Outro limite de tamanho…|você escolhe o tamanho máximo, em MB\n'
+}
+
+flow_convert_folder() {   # $1 = pasta (vazio = abre o seletor)
+    local dir="${1:-}" start rec=0 f i n nv=0 na=0 rows="" sel ans pv="" pa="" id kind dur size
+    local -a ids=() chosen=()
+    local ok=0 skipped=0 failed=0 tin=0 tout=0 k=0 text res
+    mkwork
+    : >"$WORKD/lasterr"
+    if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+        ui_info "Para converter é preciso o ffmpeg. Gere o AppImage sem a opção --sem-ffmpeg."
+        return 0
+    fi
+    if [ -z "$dir" ]; then
+        start="$(xdg-user-dir VIDEOS 2>/dev/null || true)"; [ -d "$start" ] || start="$HOME"
+        dir="$(ui_pick_dir "Escolha a pasta com os vídeos e músicas" "$start")" || return 0
+        [ -n "$dir" ] || return 0
+    fi
+    if [ ! -d "$dir" ]; then ui_info "Pasta não encontrada:
+$dir"; return 0; fi
+    ui_confirm "Pasta: $dir
+
+Incluir também as subpastas?" "Incluir subpastas" "Só esta pasta" n && rec=1
+    FOLDER_FILES=()
+    while IFS= read -r -d '' f; do
+        case "$(basename "$f")" in
+            *.parcial.* | *" ("discord*")."* | *" ("whatsapp*")."* | *" ("social*")."* | *" ("mp3-192*")."* | *" ("mp3-128*")."* | *" ("audio*")."* | *" ("compacto*")."*) continue ;;
+        esac
+        FOLDER_FILES+=("$f")
+        [ "${#FOLDER_FILES[@]}" -ge 300 ] && break
+    done < <(find "$dir" $([ "$rec" = 1 ] || echo -maxdepth 1) -type f -regextype posix-extended -iregex ".*\\.($MEDIA_EXT)" -print0 2>/dev/null | sort -z)
+    if [ "${#FOLDER_FILES[@]}" -eq 0 ]; then
+        ui_info "Não encontrei vídeos nem músicas nessa pasta (os arquivos já convertidos pelo Zapt são ignorados)."
+        return 0
+    fi
+    RUN_KIND=pulse ui_run "Lendo a pasta…" folder_scan_job
+    [ $? -eq 130 ] && return 0
+    [ -s "$WORKD/folder.tsv" ] || { ui_info "Não consegui ler nenhum desses arquivos como vídeo ou áudio."; return 0; }
+    rows=""
+    while IFS='|' read -r i f kind dur size; do
+        rows+="$i|${f#"$dir"/}|$([ "$kind" = video ] && echo vídeo || echo música) · $(fmt_dur "$dur") · $(fmt_mb "$size")"$'\n'
+    done <"$WORKD/folder.tsv"
+    sel="$(printf '%s' "$rows" | ui_checklist "Converter uma pasta" \
+        "Encontrei $(grep -c . "$WORKD/folder.tsv") arquivo(s). Todos já vêm marcados; desmarque os que você não quer converter." \
+        "Arquivo" "Tipo · duração · tamanho")" || return 0
+    mapfile -t chosen <<<"$sel"
+    [ -n "${chosen[0]:-}" ] || return 0
+    for i in "${chosen[@]}"; do
+        kind="$(awk -F'|' -v i="$i" '$1 == i { print $3 }' "$WORKD/folder.tsv")"
+        if [ "$kind" = video ]; then nv=$((nv + 1)); else na=$((na + 1)); fi
+    done
+    CUSTOM_LIM=""
+    if [ "$nv" -gt 0 ]; then
+        pv="$(folder_video_rows | ui_choose "Converter uma pasta" "Para onde vão os $nv vídeo(s)?" "" "Para onde vai" "O que será feito")" || return 0
+    fi
+    if [ "$na" -gt 0 ]; then
+        pa="$(folder_audio_rows | ui_choose "Converter uma pasta" "Para onde vão as $na música(s)?" "" "Para onde vai" "O que será feito")" || return 0
+    fi
+    if [ "$pv" = custom ] || [ "$pa" = custom ]; then
+        ans="$(ui_entry "Tamanho máximo" "Tamanho máximo de cada arquivo, em MB (exemplo: 25):" "25")" || return 0
+        ans="${ans//,/.}"
+        is_pos "$ans" || { ui_info "Digite um número maior que zero."; return 0; }
+        CUSTOM_LIM="$ans"
+    fi
+    AF_MODE="none"; af_build
+    if [ "$na" -gt 0 ]; then ask_audio_adjust || return 0; fi
+    text="Converter $((nv + na)) arquivo(s)?"
+    [ "$nv" -gt 0 ] && { preset_info "$pv"; text+="
+ • $nv vídeo(s) → $(preset_label "$pv")"; }
+    [ "$na" -gt 0 ] && { preset_info "$pa"; text+="
+ • $na música(s) → $(preset_label "$pa")$(af_desc)"; }
+    text+="
+
+Os arquivos novos ficam ao lado dos originais, com o destino no nome (por exemplo, \"video (discord).mp4\"). Os originais não são mexidos."
+    ui_confirm "$text" "Converter tudo" "Voltar" || return 0
+
+    CLIP_ON=0; CLIP_TAG=""; CLIP_IN=(); CONV_QUIET=1
+    n="${#chosen[@]}"; k=0
+    : >"$WORKD/folder_fail.txt"; : >"$WORKD/folder_skip.txt"
+    for i in "${chosen[@]}"; do
+        k=$((k + 1))
+        f="$(awk -F'|' -v i="$i" '$1 == i { print $2 }' "$WORKD/folder.tsv")"
+        probe_file "$f" || { failed=$((failed + 1)); printf '%s\n' "${f#"$dir"/}" >>"$WORKD/folder_fail.txt"; continue; }
+        CONV_IN="$f"; P_EXT="${f##*.}"
+        if [ "$P_KIND" = video ]; then id="$pv"; else id="$pa"; fi
+        if ! conv_prepare "$id"; then
+            skipped=$((skipped + 1)); printf '%s\n' "${f#"$dir"/}" >>"$WORKD/folder_skip.txt"
+            continue
+        fi
+        CONV_LABEL="Convertendo $k de $n: $(basename "$f")"
+        conv_run
+        res=$?
+        if [ "$res" -eq 130 ]; then
+            CONV_LABEL=""; CONV_QUIET=0
+            ui_info "Cancelado. $ok arquivo(s) já tinham sido convertidos e continuam na pasta."
+            return 0
+        fi
+        if [ "$res" -ne 0 ]; then
+            failed=$((failed + 1)); printf '%s\n' "${f#"$dir"/}" >>"$WORKD/folder_fail.txt"
+            continue
+        fi
+        ok=$((ok + 1)); tin=$((tin + P_SIZE)); tout=$((tout + CV_ACTUAL))
+        record_size converter-pasta "$CV_DESC" "$CV_EST" "$CV_ACTUAL"
+    done
+    CONV_LABEL=""; CONV_QUIET=0
+    text="Pronto! $ok de $n arquivo(s) convertido(s)."
+    [ "$ok" -gt 0 ] && text+="
+Tamanho: $(fmt_mb "$tin") → $(fmt_mb "$tout")"
+    text+="
+Pasta: $dir"
+    [ "$skipped" -gt 0 ] && text+="
+
+Já cabiam no limite, então não precisaram converter ($skipped):
+$(head -n 8 "$WORKD/folder_skip.txt" | sed 's/^/ • /')"
+    [ "$failed" -gt 0 ] && text+="
+
+Falharam ($failed):
+$(head -n 8 "$WORKD/folder_fail.txt" | sed 's/^/ • /')"
+    if ui_confirm "$text" "Abrir pasta" "Fechar" n; then
+        xdg-open "$dir" >/dev/null 2>&1 &
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Menu principal e escolha do modo de interface
 # ---------------------------------------------------------------------------
 CONV_FILES=()
@@ -2167,12 +2934,15 @@ CONV_FILES=()
 main_menu() {
     local c u
     update_notice
+    app_update_notice
+    resume_notice
     while true; do
         [ -n "$YTDLP_VER" ] || YTDLP_VER="$("$YTDLP" --version 2>/dev/null)"
         c="$(ui_menu "Zapt" "Zapt (yt-dlp $YTDLP_VER) — o que você quer fazer?" Sair <<EOF
 musica|Baixar música
 video|Baixar vídeo
 converter|Converter um arquivo para compartilhar…
+pasta|Converter uma pasta inteira…
 atualizar|Atualizar o yt-dlp$(u="$(update_available)" && printf ' (há uma versão nova: %s)' "$u")
 mais|Mais opções…
 EOF
@@ -2180,6 +2950,7 @@ EOF
         case "$c" in
             musica | video) flow_download "$c" ;;
             converter) flow_convert "" ;;
+            pasta) flow_convert_folder "" ;;
             atualizar) flow_update "" ;;
             mais) flow_more ;;
         esac
@@ -2190,13 +2961,16 @@ run_flow() {
     local f
     case "$1" in
         "") main_menu ;;
-        musica | video) update_notice; flow_download "$1" ;;
+        musica | video) update_notice; app_update_notice; resume_notice; flow_download "$1" ;;
         atualizar) flow_update "" ;;
+        pasta) flow_convert_folder "${CONV_FILES[0]:-}" ;;
         converter)
             if [ "${#CONV_FILES[@]}" -eq 0 ]; then
                 flow_convert ""
             else
-                for f in "${CONV_FILES[@]}"; do flow_convert "$f"; done
+                for f in "${CONV_FILES[@]}"; do
+                    if [ -d "$f" ]; then flow_convert_folder "$f"; else flow_convert "$f"; fi
+                done
             fi
             ;;
     esac
@@ -2219,6 +2993,7 @@ interactive() {
         echo "Instale o zenity (sudo apt install zenity) ou rode a partir de um terminal." >&2
         exit 1
     fi
+    apply_cookies
     run_flow "$flow"
     exit 0
 }
@@ -2255,6 +3030,8 @@ case "${1:-}" in
     --gui-video) interactive video ;;
     --gui-atualizar) interactive atualizar ;;
     --gui-converter) interactive converter ;;
+    --gui-converter-pasta) interactive pasta ;;
+    --converter-pasta) shift; CONV_FILES=("$@"); interactive pasta ;;
     --fluxo) interactive "${2:-}" ;;
     --converter) shift; CONV_FILES=("$@"); interactive converter ;;
 esac
@@ -2264,7 +3041,7 @@ if [ "$#" -ge 1 ]; then
     ALL_FILES=1
     for a in "$@"; do
         case "$a" in -*) ALL_FILES=0; break ;; esac
-        [ -f "$a" ] || { ALL_FILES=0; break; }
+        [ -f "$a" ] || [ -d "$a" ] || { ALL_FILES=0; break; }
     done
     if [ "$ALL_FILES" = 1 ]; then CONV_FILES=("$@"); interactive converter; fi
 fi
