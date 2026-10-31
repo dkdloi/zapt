@@ -3,6 +3,11 @@
 O número da versão é a data (`ano.mês.dia`). O arquivo `VERSION` guarda a versão mais recente;
 o Zapt confere esse arquivo de vez em quando e avisa quando há uma nova.
 
+## 2026.10.31.1
+
+- **Correção**: a conversão para Discord/WhatsApp falhava com o ffmpeg mais recente ("Error reading log file
+  ... for pass-2 encoding"), porque o modo de 2 passadas passou a valer também para o áudio.
+
 ## 2026.10.31
 
 - **Correção**: o script de montagem voltou a gerar o AppImage com o `appimagetool` mais novo, que passou a

@@ -174,7 +174,7 @@ HERE="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
 export PATH="$HERE/usr/bin:$PATH"
 export LC_NUMERIC=C
 
-ZAPT_VERSION="2026.10.31"
+ZAPT_VERSION="2026.10.31.1"
 APP_SHARE="$HERE/usr/share/ytdlp-app"
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/yt-dlp-appimage"
 USER_BIN="$DATA_DIR/yt-dlp"            # cópia do yt-dlp que o app atualiza
@@ -2446,10 +2446,10 @@ encode_video_cpu() {   # entrada saída   (usa PL_*)
     if [ "$PL_MODE" = twopass ]; then
         echo "1/2" >"$WORKD/stage"
         ff -y "${CLIP_IN[@]}" -i "$in" -map "0:$P_VIDX" "${vfa[@]}" -c:v libx264 -preset fast -profile:v high -pix_fmt yuv420p \
-            -b:v "${PL_VK}k" -pass 1 -passlogfile "$WORKD/pass" -an -f null /dev/null || { rm -f "$tmp"; return 1; }
+            -b:v "${PL_VK}k" -pass:v 1 -passlogfile "$WORKD/pass" -an -f null /dev/null || { rm -f "$tmp"; return 1; }
         echo "2/2" >"$WORKD/stage"
         ff -y "${CLIP_IN[@]}" -i "$in" -map "0:$P_VIDX" "${amap[@]}" "${vfa[@]}" -c:v libx264 -preset fast -profile:v high -pix_fmt yuv420p \
-            -b:v "${PL_VK}k" -pass 2 -passlogfile "$WORKD/pass" "${aa[@]}" -movflags +faststart "$tmp" || { rm -f "$tmp"; return 1; }
+            -b:v "${PL_VK}k" -pass:v 2 -passlogfile "$WORKD/pass" "${aa[@]}" -movflags +faststart "$tmp" || { rm -f "$tmp"; return 1; }
     else
         echo "1/1" >"$WORKD/stage"
         ff -y "${CLIP_IN[@]}" -i "$in" -map "0:$P_VIDX" "${amap[@]}" "${vfa[@]}" -c:v libx264 -preset fast -profile:v high -pix_fmt yuv420p \
