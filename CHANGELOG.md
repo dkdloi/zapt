@@ -3,6 +3,11 @@
 O número da versão é a data (`ano.mês.dia`). O arquivo `VERSION` guarda a versão mais recente;
 o Zapt confere esse arquivo de vez em quando e avisa quando há uma nova.
 
+## 2026.10.31
+
+- **Correção**: o script de montagem voltou a gerar o AppImage com o `appimagetool` mais novo, que passou a
+  exigir ícone em PNG (o erro era ".DirIcon is an SVG image").
+
 ## 2026.10.23
 
 - **Cookies do navegador** para vídeos com restrição de idade, só para membros ou com verificação do YouTube
